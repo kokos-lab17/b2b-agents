@@ -250,6 +250,7 @@ export default function Home() {
   const [captured, setCaptured] = useState(false);
   const [paypalNotice, setPaypalNotice] = useState<string | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
+  const [captureFailedToken, setCaptureFailedToken] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollInFlightRef = useRef(false);
@@ -367,7 +368,8 @@ export default function Home() {
       confirmingRef.current = true;
       setIsCapturing(true);
       setError('');
-      setPaypalNotice(`Capturing PayPal Sandbox payment for order ${tokenToCapture}...`);
+      setCaptureFailedToken(null);
+      setPaypalNotice('Verifying PayPal payment and capturing transaction...');
 
       try {
         const controller = new AbortController();
@@ -385,6 +387,7 @@ export default function Home() {
           setCaptured(true);
           setPhase('completed');
           setPaypalNotice(null);
+          setCaptureFailedToken(null);
           if (typeof window !== 'undefined') {
             window.history.replaceState({}, document.title, window.location.pathname);
           }
@@ -402,7 +405,8 @@ export default function Home() {
           clearTimeout(timeout);
         }
       } catch (err: any) {
-        setError(err?.message || 'Payment confirmation failed. Please try again.');
+        setError(err?.message || 'Payment verification failed. Please retry.');
+        setCaptureFailedToken(tokenToCapture);
         setPaypalNotice(null);
       } finally {
         setIsCapturing(false);
@@ -421,19 +425,17 @@ export default function Home() {
       const isCancelled = urlParams.get('paypal_cancel') === 'true';
       const isReturn = urlParams.get('paypal_return') === 'true';
       const tokenParam = urlParams.get('token');
-      const storedToken = getStoredOrderId();
 
       if (isCancelled) {
+        removeStoredOrderId();
         setPaypalNotice(
-          'PayPal checkout was cancelled. You can review the negotiated deal and approve or restart anytime.'
+          'PayPal checkout was cancelled. No payment was captured. You can review the negotiated deal and approve or restart anytime.'
         );
         window.history.replaceState({}, document.title, window.location.pathname);
-      } else if (isReturn || tokenParam) {
-        const activeToken = tokenParam || storedToken;
-        if (activeToken) {
-          setOrderId(activeToken);
-          executePaymentCapture(activeToken);
-        }
+      } else if (tokenParam && !isCancelled) {
+        // Buyer approved on PayPal and returned to the application with order token
+        setOrderId(tokenParam);
+        executePaymentCapture(tokenParam);
       }
     }
 
@@ -525,17 +527,8 @@ export default function Home() {
     if (orderId) {
       setStoredOrderId(orderId);
     }
-    // Redirect so PayPal return redirect returns cleanly to the deployed application
+    // Single consistent navigation: redirect in the same tab
     window.location.href = url;
-  };
-
-  const confirmPayment = async () => {
-    const tokenToConfirm = orderId || getStoredOrderId();
-    if (!tokenToConfirm) {
-      setError('No PayPal order to confirm yet.');
-      return;
-    }
-    await executePaymentCapture(tokenToConfirm);
   };
 
   const running = phase === 'running';
@@ -726,6 +719,23 @@ export default function Home() {
         </div>
       )}
 
+      {captureFailedToken && !isCapturing && (
+        <div className="mt-6 flex flex-col gap-3 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300 shadow-md sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="font-semibold text-red-400">PayPal Payment Verification Failed</p>
+            <p className="mt-0.5 text-xs text-red-300">
+              Order {captureFailedToken} was approved on PayPal, but final capture confirmation encountered an error.
+            </p>
+          </div>
+          <button
+            onClick={() => executePaymentCapture(captureFailedToken)}
+            className="rounded-md bg-red-600 px-4 py-2 text-xs font-semibold text-white shadow transition-colors hover:bg-red-500"
+          >
+            Retry Verification & Capture
+          </button>
+        </div>
+      )}
+
       {phase === 'failed' && !error && (
         <div className="mt-6 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400">
           The procurement run failed. Please verify credentials or retry in Demo mode.
@@ -901,41 +911,17 @@ export default function Home() {
                 Pending Sandbox Order ID: <span className="font-mono text-white">{orderId}</span>
               </p>
             )}
-            <div className="mt-4 flex flex-wrap items-center gap-3">
+            <div className="mt-4 flex items-center">
               <button
                 onClick={() => openApprove(approveUrl)}
                 disabled={isCapturing}
-                className="rounded-md bg-green-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-green-500 disabled:opacity-50"
+                className="rounded-md bg-green-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-green-500 disabled:opacity-50"
               >
                 Approve on PayPal Sandbox
               </button>
-              <a
-                href={approveUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => {
-                  if (orderId) setStoredOrderId(orderId);
-                }}
-                className="rounded-md border border-gray-700 bg-gray-800/80 px-4 py-2.5 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700 hover:text-white"
-              >
-                Open in New Tab ↗
-              </a>
-              <button
-                onClick={confirmPayment}
-                disabled={!orderId || isCapturing}
-                className="inline-flex items-center gap-2 rounded-md border border-blue-500/50 bg-blue-600/20 px-5 py-2.5 text-sm font-semibold text-blue-300 shadow-md transition-colors hover:bg-blue-600/40 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {isCapturing && (
-                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-                  </svg>
-                )}
-                Confirm Payment & Settle
-              </button>
             </div>
-            <p className="mt-2 text-xs text-gray-400">
-              Credentials remain strictly on the backend server. Payment capture completes automatically upon approval return or manual confirmation.
+            <p className="mt-3 text-xs text-gray-400">
+              You will be redirected to PayPal Sandbox in this tab to review and approve terms. Once approved, PayPal will return you here to verify and finalize payment capture automatically.
             </p>
           </div>
         </section>

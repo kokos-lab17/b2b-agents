@@ -203,13 +203,65 @@ async def confirm_payment(token: str):
     # Live PayPal Capture
     try:
         client = PayPalClient()
-        await asyncio.to_thread(client.capture_order, token)
+
+        # Step 1: Pre-capture validation: Verify PayPal order details, status, amount, and currency
+        order_details = await asyncio.to_thread(client.get_order_details, token)
+        order_status = order_details.get("status")
+
+        # If already captured on PayPal, record and return idempotent success
+        if order_status == "COMPLETED":
+            record_payment_captured(token)
+            status = "captured"
+            return {"status": "captured", "order_id": token, "already_captured": True}
+
+        # Creating an order must NOT capture money. Buyer must first approve on PayPal.
+        if order_status != "APPROVED":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot capture PayPal order '{token}': Order status is '{order_status}', "
+                    "expected 'APPROVED'. Buyer has not approved this order on PayPal yet."
+                ),
+            )
+
+        # Validate currency and amount against the expected commercial deal
+        if tx and tx.get("amount") is not None:
+            expected_amount = float(tx["amount"])
+            purchase_units = order_details.get("purchase_units", [])
+            if purchase_units:
+                unit_amount_info = purchase_units[0].get("amount", {})
+                currency_code = unit_amount_info.get("currency_code", "USD")
+                order_value = float(unit_amount_info.get("value", 0.0))
+                if currency_code != "USD":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Currency mismatch for order '{token}': Expected 'USD', found '{currency_code}'.",
+                    )
+                if abs(order_value - expected_amount) > 0.01:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Amount mismatch for order '{token}': Expected ${expected_amount:.2f}, "
+                            f"PayPal order is ${order_value:.2f}."
+                        ),
+                    )
+
+        # Step 2: Capture verified order only after buyer approval and terms validation
+        capture_result = await asyncio.to_thread(client.capture_order, token)
+        if capture_result.get("status") != "COMPLETED":
+            raise HTTPException(
+                status_code=502,
+                detail=f"PayPal capture failed: Final status is '{capture_result.get('status')}', expected 'COMPLETED'.",
+            )
+
         captured = record_payment_captured(token)
         if not captured:
             raise HTTPException(
                 status_code=500,
                 detail=f"Payment captured via PayPal Sandbox, but database record for order '{token}' failed to update.",
             )
+    except HTTPException:
+        raise
     except PayPalError as exc:
         logger.error("PayPal capture error: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc

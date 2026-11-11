@@ -170,6 +170,118 @@ class TestPayPalAndAPI(unittest.TestCase):
         self.assertEqual(data["status"], "captured")
         self.assertTrue(data.get("already_captured"))
 
+    @patch("main.PayPalClient")
+    @patch("main.get_transaction")
+    def test_confirm_payment_rejects_unapproved_order(self, mock_get_tx, mock_pp_cls):
+        """Cannot capture PayPal order before buyer approval on PayPal (status must be APPROVED)."""
+        mock_get_tx.return_value = {
+            "session_id": "sess-1",
+            "order_id": "8AB12345678901234",
+            "amount": 5000.0,
+            "status": "awaiting_approval",
+        }
+        mock_pp = MagicMock()
+        mock_pp_cls.return_value = mock_pp
+        # Order is still in CREATED status (not approved by buyer yet)
+        mock_pp.get_order_details.return_value = {
+            "id": "8AB12345678901234",
+            "status": "CREATED",
+            "purchase_units": [{"amount": {"currency_code": "USD", "value": "5000.00"}}],
+        }
+
+        response = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Buyer has not approved this order", response.json()["detail"])
+        # Ensure capture was NEVER called
+        mock_pp.capture_order.assert_not_called()
+
+    @patch("main.PayPalClient")
+    @patch("main.get_transaction")
+    def test_confirm_payment_validates_currency_and_amount(self, mock_get_tx, mock_pp_cls):
+        """Reject capture if PayPal order amount or currency does not match the agreed deal."""
+        mock_get_tx.return_value = {
+            "session_id": "sess-1",
+            "order_id": "8AB12345678901234",
+            "amount": 5000.0,
+            "status": "awaiting_approval",
+        }
+        mock_pp = MagicMock()
+        mock_pp_cls.return_value = mock_pp
+        # Currency mismatch test
+        mock_pp.get_order_details.return_value = {
+            "id": "8AB12345678901234",
+            "status": "APPROVED",
+            "purchase_units": [{"amount": {"currency_code": "EUR", "value": "5000.00"}}],
+        }
+        resp1 = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        self.assertEqual(resp1.status_code, 400)
+        self.assertIn("Currency mismatch", resp1.json()["detail"])
+
+        # Amount mismatch test
+        mock_pp.get_order_details.return_value = {
+            "id": "8AB12345678901234",
+            "status": "APPROVED",
+            "purchase_units": [{"amount": {"currency_code": "USD", "value": "2500.00"}}],
+        }
+        resp2 = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        self.assertEqual(resp2.status_code, 400)
+        self.assertIn("Amount mismatch", resp2.json()["detail"])
+
+    @patch("main.PayPalClient")
+    @patch("main.get_transaction")
+    @patch("main.record_payment_captured")
+    def test_confirm_payment_captures_valid_approved_order(self, mock_record, mock_get_tx, mock_pp_cls):
+        """Approved order with matching terms captures successfully and records in memory."""
+        mock_get_tx.return_value = {
+            "session_id": "sess-1",
+            "order_id": "8AB12345678901234",
+            "amount": 5000.0,
+            "status": "awaiting_approval",
+        }
+        mock_record.return_value = True
+        mock_pp = MagicMock()
+        mock_pp_cls.return_value = mock_pp
+        mock_pp.get_order_details.return_value = {
+            "id": "8AB12345678901234",
+            "status": "APPROVED",
+            "purchase_units": [{"amount": {"currency_code": "USD", "value": "5000.00"}}],
+        }
+        mock_pp.capture_order.return_value = {
+            "id": "8AB12345678901234",
+            "status": "COMPLETED",
+        }
+
+        response = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "captured")
+        mock_pp.capture_order.assert_called_once_with("8AB12345678901234")
+        mock_record.assert_called_once_with("8AB12345678901234")
+
+    @patch("backend.paypal.httpx.Client")
+    def test_paypal_client_capture_order_fails_if_status_not_completed(self, mock_client_cls):
+        """Never treat an order merely being APPROVED as captured. Only COMPLETED is valid."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        token_resp = MagicMock()
+        token_resp.json.return_value = {"access_token": "mock_token_123"}
+        token_resp.status_code = 200
+
+        # Simulate PayPal capture response returning APPROVED instead of COMPLETED
+        capture_resp = MagicMock()
+        capture_resp.status_code = 200
+        capture_resp.json.return_value = {
+            "id": "8AB12345678901234",
+            "status": "APPROVED",
+        }
+
+        mock_client.post.side_effect = [token_resp, capture_resp]
+        client = PayPalClient(client_id="test_id", secret="test_secret")
+        with self.assertRaises(PayPalError) as ctx:
+            client.capture_order("8AB12345678901234")
+        self.assertIn("expected 'COMPLETED'", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
