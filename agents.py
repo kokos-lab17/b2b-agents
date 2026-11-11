@@ -1,5 +1,4 @@
 """Backward-compatible facade exposing run_procurement and capture_payment."""
-import asyncio
 from typing import Any, Callable
 
 from backend.memory import record_payment_captured
@@ -10,7 +9,9 @@ from backend.paypal import PayPalClient
 def capture_payment(order_id: str) -> dict[str, Any]:
     """Capture an approved PayPal order and record in persistent memory."""
     if order_id.startswith("DEMO-"):
-        record_payment_captured(order_id)
+        success = record_payment_captured(order_id)
+        if not success:
+            raise ValueError(f"No active demo order matching '{order_id}' found to capture.")
         return {"status": "COMPLETED", "order_id": order_id, "mode": "demo"}
 
     client = PayPalClient()
@@ -30,7 +31,6 @@ def run_procurement(
     """Run procurement through the autonomous multi-agent negotiation engine."""
     def event_adapter(evt: dict[str, Any]):
         if step_callback:
-            # Matches legacy step_callback(role, step_dict)
             step_callback(evt["agent"], evt)
 
     engine = NegotiationEngine(
