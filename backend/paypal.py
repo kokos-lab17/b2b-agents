@@ -190,7 +190,7 @@ class PayPalClient:
                 resp.raise_for_status()
                 data = resp.json()
                 status = data.get("status")
-                if status not in ("COMPLETED", "APPROVED"):
+                if status != "COMPLETED":
                     raise PayPalError(
                         f"PayPal capture failed: Order status is {status}, expected COMPLETED."
                     )
