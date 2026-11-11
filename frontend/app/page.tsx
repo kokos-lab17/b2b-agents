@@ -7,7 +7,7 @@ import { AgGridReact } from 'ag-grid-react';
 ModuleRegistry.registerModules([AllCommunityModule]);
 
 const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+  process.env.NEXT_PUBLIC_BACKEND_URL || 'https://b2b-agents.onrender.com';
 
 type CommercialTerms = {
   unit_price: number;

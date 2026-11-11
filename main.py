@@ -167,16 +167,21 @@ async def confirm_payment(token: str):
     with _lock:
         expected_order_id = order_id
 
-    # Security check: Validate the capture token against the current pending order
-    if expected_order_id and token != expected_order_id:
+    # Security check: Reject tokens unless they match the active pending order
+    if not expected_order_id or token != expected_order_id:
         raise HTTPException(
             status_code=400,
-            detail=f"Token mismatch: Provided token '{token}' does not match pending order '{expected_order_id}'",
+            detail=f"Token mismatch: Provided token '{token}' does not match active pending order '{expected_order_id}'",
         )
 
     if token.startswith("DEMO-"):
-        # Simulated demo capture
-        record_payment_captured(token)
+        # Simulated demo capture: Only succeeds if active record exists and was updated
+        captured = record_payment_captured(token)
+        if not captured:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No pending transaction found matching demo token '{token}' or already captured.",
+            )
         status = "captured"
         _append_event(
             {
@@ -192,7 +197,12 @@ async def confirm_payment(token: str):
     try:
         client = PayPalClient()
         await asyncio.to_thread(client.capture_order, token)
-        record_payment_captured(token)
+        captured = record_payment_captured(token)
+        if not captured:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Payment captured via PayPal Sandbox, but database record for order '{token}' failed to update.",
+            )
     except PayPalError as exc:
         logger.error("PayPal capture error: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc

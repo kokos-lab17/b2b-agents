@@ -6,13 +6,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from backend.config import settings
-from backend.groq_client import GroqClient
+from backend.groq_client import BudgetExhaustedError, GroqClient
 from backend.models import (
+    BuyerProposal,
     CommercialOffer,
     CommercialScoreBreakdown,
     Event,
     PrivateSellerConstraint,
     SupplierProfile,
+    validate_and_sanitize_offer,
 )
 from backend.memory import (
     ensure_supplier_profile,
@@ -142,19 +144,18 @@ class NegotiationEngine:
             event_type="procurement_start",
         )
 
-        # 2. Buyer Strategy Formulation
-        current_strategy = "PRICE_DISCOUNT"
+        # 2. Buyer Strategy Formulation: Initial strategy based on product & budget
+        initial_strategy = "PRICE_DISCOUNT"
         target_discount_unit = round(self.budget * 0.80, 2)
         self._emit(
             agent="Buyer Agent",
             message=(
-                f"Formulating commercial procurement strategy for {self.product}. "
-                f"Setting initial negotiation strategy to '{current_strategy}'. "
-                f"Opening aggressive target price: ${target_discount_unit:.2f}/unit."
+                f"Formulating initial commercial strategy for {self.qty} units of {self.product}. "
+                f"Opening strategy: '{initial_strategy}'. Target unit price: ${target_discount_unit:.2f}/unit."
             ),
             status="negotiating",
             event_type="strategy_switch",
-            strategy=current_strategy,
+            strategy=initial_strategy,
             offer=target_discount_unit,
         )
 
@@ -162,75 +163,80 @@ class NegotiationEngine:
         round1_offers: dict[str, CommercialOffer] = {}
         for key, p in self.sellers_info.items():
             offer = self._seller_round1_decision(key, target_discount_unit)
-            round1_offers[key] = offer
+            # Python validation enforcement across all 5 dimensions
+            validated_offer = validate_and_sanitize_offer(offer, self.private_constraints[key], self.qty)
+            round1_offers[key] = validated_offer
+
             self._emit(
                 agent=p["name"],
                 message=(
-                    f"[{p['style']}] Evaluated buyer inquiry for {self.qty} units. "
-                    f"Counteroffer: ${offer.unit_price:.2f}/unit, "
-                    f"lead time {offer.delivery_days} days, warranty {offer.warranty_months} mos, "
-                    f"freight ${offer.shipping_cost:.2f}, terms: {offer.payment_terms}."
+                    f"[{p['style']}] Evaluated opening inquiry. Counteroffer: ${validated_offer.unit_price:.2f}/unit, "
+                    f"lead time {validated_offer.delivery_days} days, warranty {validated_offer.warranty_months} mos, "
+                    f"freight ${validated_offer.shipping_cost:.2f}, terms: {validated_offer.payment_terms}."
                 ),
                 status="negotiating",
                 event_type="counteroffer",
-                strategy=current_strategy,
-                offer=offer.unit_price,
-                details=offer.model_dump(),
+                strategy=initial_strategy,
+                offer=validated_offer.unit_price,
+                details=validated_offer.model_dump(),
             )
             record_negotiation_attempt(
                 session_id=self.session_id,
                 supplier_name=p["name"],
                 rounds=1,
                 outcome="countered",
-                final_unit_price=offer.unit_price,
-                final_total_price=offer.total_price,
+                final_unit_price=validated_offer.unit_price,
+                final_total_price=validated_offer.total_price,
             )
 
-        # 4. Autonomous Strategy Adaptation (Feature 2 & 3)
-        # Buyer analyses Round 1: All suppliers pushed back on steep price cut.
-        # Buyer recognizes price negotiation has diminishing returns and autonomously changes strategy.
-        current_strategy = "WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION"
+        # 4. Genuinely Autonomous Buyer Evaluation & Concrete Proposals (Feature 1 & 2)
+        # Buyer dynamically evaluates the actual seller responses and decides whether to continue
+        # with price or adaptively switch strategies based on seller pushback.
+        buyer_decision = self._buyer_evaluate_and_decide(round1_offers)
+        current_strategy = buyer_decision["chosen_strategy"]
+        proposals_by_seller = buyer_decision["proposals"]
+
         self._emit(
             agent="Buyer Agent",
-            message=(
-                "Autonomous Evaluation: Sellers demonstrated firm resistance to aggressive unit price cuts. "
-                "Seller A cited volume constraints, Seller B defended premium engineering, and Seller C flagged freight margins. "
-                "Pivoting strategy from 'PRICE_DISCOUNT' to 'WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION' to capture commercial value "
-                "through extended warranties, waived shipping, and Net 60 payment terms without eroding supplier margin."
-            ),
+            message=f"Autonomous State Analysis: {buyer_decision['strategy_reasoning']}",
             status="negotiating",
             event_type="strategy_switch",
             strategy=current_strategy,
         )
 
-        # 5. Round 2: Adaptive Targeted Multi-Variable Counter-Proposals
+        # 5. Round 2: Sellers Evaluate Buyer's Concrete Structured Proposals
         final_offers: dict[str, CommercialOffer] = {}
         for key, p in self.sellers_info.items():
             r1 = round1_offers[key]
-            offer_r2 = self._seller_round2_decision(key, r1, current_strategy)
-            final_offers[key] = offer_r2
-            concession_summary = ", ".join(offer_r2.special_concessions) if offer_r2.special_concessions else "terms adjusted"
+            prop = proposals_by_seller.get(key)
+            offer_r2 = self._seller_round2_decision(key, r1, prop, current_strategy)
+            # Python validation enforcement across all 5 dimensions
+            validated_r2 = validate_and_sanitize_offer(offer_r2, self.private_constraints[key], self.qty)
+            final_offers[key] = validated_r2
+
+            concession_summary = ", ".join(validated_r2.special_concessions) if validated_r2.special_concessions else "terms adjusted"
             self._emit(
                 agent=p["name"],
                 message=(
-                    f"[{p['style']}] Received non-price value proposal. Concession granted: {concession_summary}. "
-                    f"Final terms: ${offer_r2.unit_price:.2f}/unit, "
-                    f"warranty {offer_r2.warranty_months} mos, lead time {offer_r2.delivery_days} days, "
-                    f"shipping ${offer_r2.shipping_cost:.2f}, terms: {offer_r2.payment_terms}."
+                    f"[{p['style']}] Evaluated buyer proposal ({prop.rationale if prop else current_strategy}). "
+                    f"Decision: {concession_summary}. "
+                    f"Final terms: ${validated_r2.unit_price:.2f}/unit, "
+                    f"warranty {validated_r2.warranty_months} mos, lead time {validated_r2.delivery_days} days, "
+                    f"shipping ${validated_r2.shipping_cost:.2f}, terms: {validated_r2.payment_terms}."
                 ),
                 status="negotiating",
                 event_type="counteroffer",
                 strategy=current_strategy,
-                offer=offer_r2.unit_price,
-                details=offer_r2.model_dump(),
+                offer=validated_r2.unit_price,
+                details=validated_r2.model_dump(),
             )
             record_negotiation_attempt(
                 session_id=self.session_id,
                 supplier_name=p["name"],
                 rounds=2,
                 outcome="final_terms_proposed",
-                final_unit_price=offer_r2.unit_price,
-                final_total_price=offer_r2.total_price,
+                final_unit_price=validated_r2.unit_price,
+                final_total_price=validated_r2.total_price,
             )
 
         # 6. Deterministic Multi-Factor Commercial Scoring (Feature 4)
@@ -279,35 +285,39 @@ class NegotiationEngine:
         )
 
         # 7. Order Execution & Settlement (Feature 6 & 7)
-        order_id = None
-        approve_url = None
-
         if self.demo_mode:
-            # Deterministic Demo Mode: Visibly labelled simulation; no PayPal orders
+            # Deterministic Demo Mode: Register active demo transaction awaiting confirmation
             order_id = f"DEMO-{uuid.uuid4().hex[:12].upper()}"
+            record_deal_accepted(
+                session_id=self.session_id,
+                order_id=order_id,
+                supplier_name=winning_name,
+                amount=winning_offer.total_price,
+            )
             self._emit(
                 agent="System",
                 message=(
-                    f"SIMULATED DEAL APPROVED: Deal locked at ${winning_offer.unit_price:.2f}/unit "
-                    f"(${winning_offer.total_price:.2f} total). "
-                    "Demo mode demonstrates autonomous strategy switching without real PayPal transactions."
+                    f"SIMULATED DEAL APPROVED: Order {order_id} awaiting approval. "
+                    f"Deal locked at ${winning_offer.unit_price:.2f}/unit (${winning_offer.total_price:.2f} total). "
+                    "Demo mode demonstrates autonomous multi-agent strategy switching without real PayPal transactions."
                 ),
-                status="completed",
-                event_type="completed",
+                status="awaiting_approval",
+                event_type="order_created",
+                offer=winning_offer.unit_price,
             )
             record_session(
                 session_id=self.session_id,
                 product=self.product,
                 qty=self.qty,
                 budget=self.budget,
-                status="completed",
+                status="awaiting_approval",
                 is_demo=True,
             )
             return {
                 "session_id": self.session_id,
-                "status": "completed",
+                "status": "awaiting_approval",
                 "order_id": order_id,
-                "approve_url": None,
+                "approve_url": "https://www.sandbox.paypal.com/demo-approval",
                 "vendors": public_vendors,
                 "deal": {
                     "selected_vendor": winning_name,
@@ -390,6 +400,160 @@ class NegotiationEngine:
             }
 
     # -------------------------------------------------------------------------
+    # Buyer Agent: Genuinely Independent Evaluation & Strategy Selection
+    # -------------------------------------------------------------------------
+    def _buyer_evaluate_and_decide(self, r1_offers: dict[str, CommercialOffer]) -> dict[str, Any]:
+        """Buyer Agent evaluates actual Round 1 responses and decides next strategy."""
+        # 1. Live Groq LLM Evaluation
+        if not self.demo_mode and self.groq_client:
+            try:
+                system_prompt = (
+                    f"{BUYER_PERSONA['psychology']}\n"
+                    "You are evaluating actual Round 1 seller responses. Do NOT follow a fixed sequence.\n"
+                    "If sellers showed price flexibility, continue pushing for price discounts.\n"
+                    "If sellers resisted price cuts, pivot to non-price variables (warranty, freight, payment terms).\n"
+                    "Respond ONLY with valid JSON matching this schema:\n"
+                    "{\n"
+                    '  "chosen_strategy": "PRICE_DISCOUNT" | "WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION" | "EXPEDITED_DELIVERY_AND_TERMS",\n'
+                    '  "strategy_reasoning": "Explain why this strategy was chosen based on the seller offers",\n'
+                    '  "proposals": {\n'
+                    '     "seller_a": {"target_unit_price": float, "target_delivery_days": int, "target_warranty_months": int, "target_shipping_cost": float, "target_payment_terms": str, "rationale": str, "concession_requested": str},\n'
+                    '     "seller_b": {"target_unit_price": float, "target_delivery_days": int, "target_warranty_months": int, "target_shipping_cost": float, "target_payment_terms": str, "rationale": str, "concession_requested": str},\n'
+                    '     "seller_c": {"target_unit_price": float, "target_delivery_days": int, "target_warranty_months": int, "target_shipping_cost": float, "target_payment_terms": str, "rationale": str, "concession_requested": str}\n'
+                    "  }\n"
+                    "}"
+                )
+                r1_summary = {
+                    key: {
+                        "vendor": self.sellers_info[key]["name"],
+                        "unit_price": o.unit_price,
+                        "lead_days": o.delivery_days,
+                        "warranty_mos": o.warranty_months,
+                        "shipping": o.shipping_cost,
+                        "terms": o.payment_terms,
+                    }
+                    for key, o in r1_offers.items()
+                }
+                user_msg = (
+                    f"Product: {self.product}, Qty: {self.qty}, Budget: ${self.budget:.2f}/unit.\n"
+                    f"Actual Seller Round 1 Offers: {json.dumps(r1_summary)}\n"
+                    "Evaluate these offers. Choose the most effective strategy and formulate concrete proposals for each seller."
+                )
+                data = self.groq_client.call_agent(
+                    agent_name="Buyer Agent",
+                    system_prompt=system_prompt,
+                    user_message=user_msg,
+                )
+                if isinstance(data, dict) and "chosen_strategy" in data and "proposals" in data:
+                    parsed_proposals = {}
+                    for key, prop_dict in data.get("proposals", {}).items():
+                        if key in self.sellers_info and isinstance(prop_dict, dict):
+                            parsed_proposals[key] = BuyerProposal(
+                                target_unit_price=float(prop_dict.get("target_unit_price", self.budget * 0.85)),
+                                target_delivery_days=int(prop_dict.get("target_delivery_days", 10)),
+                                target_warranty_months=int(prop_dict.get("target_warranty_months", 12)),
+                                target_shipping_cost=float(prop_dict.get("target_shipping_cost", 0.0)),
+                                target_payment_terms=str(prop_dict.get("target_payment_terms", "Net 30")),
+                                rationale=str(prop_dict.get("rationale", "")),
+                                concession_requested=str(prop_dict.get("concession_requested", "")),
+                            )
+                    return {
+                        "chosen_strategy": str(data["chosen_strategy"]),
+                        "strategy_reasoning": str(data.get("strategy_reasoning", "Pivoting strategy based on commercial state.")),
+                        "proposals": parsed_proposals,
+                    }
+            except Exception as exc:
+                logger.warning("Groq call failed for Buyer Agent, falling back to state-dependent policy: %s", exc)
+
+        # 2. State-Dependent Decision Policy (Used in Demo Mode or Fallback)
+        # Evaluates actual numerical positions of the sellers:
+        min_offered_price = min(o.unit_price for o in r1_offers.values())
+        discount_percentage = (self.budget - min_offered_price) / self.budget
+
+        # If sellers offered >= 12% discount below budget in Round 1:
+        # Sellers demonstrated price flexibility! Buyer pushes further on price.
+        if discount_percentage >= 0.12:
+            chosen_strategy = "PRICE_DISCOUNT"
+            reasoning = (
+                f"Sellers demonstrated notable price flexibility in Round 1 (lowest offer ${min_offered_price:.2f}/unit "
+                f"is {discount_percentage*100:.1f}% below budget cap). Continuing aggressive price negotiation."
+            )
+            proposals = {
+                "seller_a": BuyerProposal(
+                    target_unit_price=round(r1_offers["seller_a"].unit_price * 0.95, 2),
+                    target_delivery_days=r1_offers["seller_a"].delivery_days,
+                    target_warranty_months=12,
+                    target_shipping_cost=r1_offers["seller_a"].shipping_cost,
+                    target_payment_terms="Net 30",
+                    rationale="Offering volume commitment in exchange for additional 5% unit price reduction.",
+                    concession_requested="Volume discount on unit price",
+                ),
+                "seller_b": BuyerProposal(
+                    target_unit_price=round(r1_offers["seller_b"].unit_price * 0.96, 2),
+                    target_delivery_days=r1_offers["seller_b"].delivery_days,
+                    target_warranty_months=18,
+                    target_shipping_cost=r1_offers["seller_b"].shipping_cost,
+                    target_payment_terms="Net 30",
+                    rationale="Requesting unit price concession matching market competitive pricing.",
+                    concession_requested="Direct price match",
+                ),
+                "seller_c": BuyerProposal(
+                    target_unit_price=round(r1_offers["seller_c"].unit_price * 0.95, 2),
+                    target_delivery_days=7,
+                    target_warranty_months=12,
+                    target_shipping_cost=r1_offers["seller_c"].shipping_cost,
+                    target_payment_terms="Net 30",
+                    rationale="Pushing for additional unit savings on standard lead times.",
+                    concession_requested="Production efficiency discount",
+                ),
+            }
+        else:
+            # Sellers showed firm resistance to price cuts (<12% discount).
+            # Buyer autonomously shifts strategy to capture commercial value from non-price variables.
+            chosen_strategy = "WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION"
+            reasoning = (
+                f"Sellers showed firm resistance to unit price cuts (lowest offer ${min_offered_price:.2f}/unit "
+                f"is only {discount_percentage*100:.1f}% below budget). Diminishing returns on further price pressure. "
+                "Pivoting strategy from 'PRICE_DISCOUNT' to 'WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION' to capture "
+                "non-price commercial value via extended warranty (24+ mos), waived freight, and Net 60 payment terms."
+            )
+            proposals = {
+                "seller_a": BuyerProposal(
+                    target_unit_price=r1_offers["seller_a"].unit_price,
+                    target_delivery_days=10,
+                    target_warranty_months=12,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 30",
+                    rationale="Accepting your unit price if freight shipping is absorbed and volume commitment is noted.",
+                    concession_requested="Waived freight shipping",
+                ),
+                "seller_b": BuyerProposal(
+                    target_unit_price=r1_offers["seller_b"].unit_price,
+                    target_delivery_days=12,
+                    target_warranty_months=24,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 30",
+                    rationale="Respecting engineering value by holding unit price in exchange for 24-month warranty and free freight.",
+                    concession_requested="Extended 24-month warranty and free shipping",
+                ),
+                "seller_c": BuyerProposal(
+                    target_unit_price=round(r1_offers["seller_c"].unit_price - 1.0, 2),
+                    target_delivery_days=5,
+                    target_warranty_months=12,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 60",
+                    rationale="Requesting expedited 5-day dispatch, Net 60 payment terms, and free freight.",
+                    concession_requested="Expedited dispatch and Net 60 terms",
+                ),
+            }
+
+        return {
+            "chosen_strategy": chosen_strategy,
+            "strategy_reasoning": reasoning,
+            "proposals": proposals,
+        }
+
+    # -------------------------------------------------------------------------
     # Seller Decision Logic (Independent Personas & Psychology)
     # -------------------------------------------------------------------------
     def _seller_round1_decision(self, seller_key: str, buyer_target: float) -> CommercialOffer:
@@ -416,22 +580,20 @@ class NegotiationEngine:
                 )
                 if isinstance(data, dict):
                     proposed_price = float(data.get("unit_price", c.target_unit_price))
-                    # Backend Python constraint enforcement
-                    safe_price = max(c.min_unit_price, round(proposed_price, 2))
                     shipping = float(data.get("shipping_cost", c.min_shipping_cost))
-                    delivery = max(c.min_delivery_days, int(data.get("delivery_days", 14)))
-                    warranty = min(c.max_warranty_months, int(data.get("warranty_months", 12)))
+                    delivery = int(data.get("delivery_days", 14))
+                    warranty = int(data.get("warranty_months", 12))
                     terms = str(data.get("payment_terms", c.allowed_payment_terms[0]))
-                    total = round(safe_price * self.qty + shipping, 2)
-                    return CommercialOffer(
-                        unit_price=safe_price,
-                        total_price=total,
+                    raw_offer = CommercialOffer(
+                        unit_price=proposed_price,
+                        total_price=round(proposed_price * self.qty + shipping, 2),
                         quantity=self.qty,
                         delivery_days=delivery,
                         warranty_months=warranty,
                         shipping_cost=shipping,
                         payment_terms=terms,
                     )
+                    return validate_and_sanitize_offer(raw_offer, c, self.qty)
             except Exception as exc:
                 logger.warning("Groq call failed for %s, falling back to deterministic policy: %s", seller_key, exc)
 
@@ -480,25 +642,32 @@ class NegotiationEngine:
             )
 
     def _seller_round2_decision(
-        self, seller_key: str, r1_offer: CommercialOffer, strategy: str
+        self,
+        seller_key: str,
+        r1_offer: CommercialOffer,
+        buyer_proposal: BuyerProposal | None,
+        strategy: str,
     ) -> CommercialOffer:
-        """Round 2: Seller evaluates buyer's non-price value strategy."""
+        """Round 2: Seller evaluates the concrete structured proposal from the Buyer."""
         c = self.private_constraints[seller_key]
         p = self.sellers_info[seller_key]
 
-        if not self.demo_mode and self.groq_client:
+        if not self.demo_mode and self.groq_client and buyer_proposal:
             try:
                 system_prompt = (
-                    f"{p['psychology']} Respond ONLY with valid JSON. "
-                    f"Your private constraint is minimum price ${c.min_unit_price:.2f}. "
-                    f"Buyer strategy: {strategy}. Trade non-price variables where it fits your style. "
-                    f"Output schema: {{\"unit_price\": float, \"delivery_days\": int, "
-                    f"\"warranty_months\": int, \"shipping_cost\": float, \"payment_terms\": str, \"special_concessions\": [str]}}"
+                    f"{p['psychology']} Respond ONLY with valid JSON.\n"
+                    f"Your private constraints: min_price=${c.min_unit_price:.2f}, min_delivery={c.min_delivery_days}d, "
+                    f"max_warranty={c.max_warranty_months}m, min_shipping=${c.min_shipping_cost:.2f}, allowed_terms={c.allowed_payment_terms}.\n"
+                    "Evaluate the buyer's concrete proposal. Make concessions ONLY where it aligns with your psychology.\n"
+                    "Output schema: {{\"unit_price\": float, \"delivery_days\": int, \"warranty_months\": int, \"shipping_cost\": float, \"payment_terms\": str, \"special_concessions\": [str]}}"
                 )
                 user_msg = (
-                    f"Your Round 1 offer was ${r1_offer.unit_price:.2f}/unit. "
-                    f"Buyer is requesting non-price concessions: extended warranty, waived freight, or Net 60. "
-                    "Provide your updated proposal."
+                    f"Your Round 1 Offer was: ${r1_offer.unit_price:.2f}/unit, {r1_offer.delivery_days} days, {r1_offer.warranty_months} mos warranty, ${r1_offer.shipping_cost:.2f} shipping, terms: {r1_offer.payment_terms}.\n"
+                    f"Buyer Proposal for you: target_price=${buyer_proposal.target_unit_price:.2f}, target_delivery={buyer_proposal.target_delivery_days} days, "
+                    f"target_warranty={buyer_proposal.target_warranty_months} mos, target_shipping=${buyer_proposal.target_shipping_cost:.2f}, terms={buyer_proposal.target_payment_terms}.\n"
+                    f"Buyer Rationale: {buyer_proposal.rationale}\n"
+                    f"Concession Requested: {buyer_proposal.concession_requested}\n"
+                    "Provide your final counter-offer."
                 )
                 data = self.groq_client.call_agent(
                     agent_name=p["name"],
@@ -507,16 +676,14 @@ class NegotiationEngine:
                 )
                 if isinstance(data, dict):
                     proposed_price = float(data.get("unit_price", r1_offer.unit_price))
-                    safe_price = max(c.min_unit_price, round(proposed_price, 2))
-                    shipping = max(c.min_shipping_cost, float(data.get("shipping_cost", 0.0)))
-                    delivery = max(c.min_delivery_days, int(data.get("delivery_days", r1_offer.delivery_days)))
-                    warranty = min(c.max_warranty_months, int(data.get("warranty_months", r1_offer.warranty_months)))
+                    shipping = float(data.get("shipping_cost", 0.0))
+                    delivery = int(data.get("delivery_days", r1_offer.delivery_days))
+                    warranty = int(data.get("warranty_months", r1_offer.warranty_months))
                     terms = str(data.get("payment_terms", "Net 30"))
                     concessions = list(data.get("special_concessions", []))
-                    total = round(safe_price * self.qty + shipping, 2)
-                    return CommercialOffer(
-                        unit_price=safe_price,
-                        total_price=total,
+                    raw_offer = CommercialOffer(
+                        unit_price=proposed_price,
+                        total_price=round(proposed_price * self.qty + shipping, 2),
                         quantity=self.qty,
                         delivery_days=delivery,
                         warranty_months=warranty,
@@ -524,25 +691,48 @@ class NegotiationEngine:
                         payment_terms=terms,
                         special_concessions=concessions,
                     )
+                    return validate_and_sanitize_offer(raw_offer, c, self.qty)
             except Exception as exc:
                 logger.warning("Groq call failed for %s round 2, using deterministic policy: %s", seller_key, exc)
 
-        # Deterministic Concession Policies
+        # Deterministic Policy (Feature 3 & 7): Distinct Psychological Bargaining
+        concession_text = buyer_proposal.concession_requested.lower() if buyer_proposal else ""
+        rationale_text = buyer_proposal.rationale.lower() if buyer_proposal else ""
+
         if seller_key == "seller_a":
-            # Hard bargainer concedes slightly on price ($1-$2 discount) in exchange for volume
-            new_price = round(max(c.min_unit_price, r1_offer.unit_price - 1.50), 2)
-            return CommercialOffer(
-                unit_price=new_price,
-                total_price=round(new_price * self.qty + 100.0, 2),
-                quantity=self.qty,
-                delivery_days=9,
-                warranty_months=12,
-                shipping_cost=100.0,
-                payment_terms="Net 30",
-                special_concessions=["Volume Rebate of $1.50/unit"],
-            )
+            # The Hard Bargainer:
+            # Genuinely resists! If buyer does NOT offer a volume commitment or valuable concession,
+            # Seller A refuses to concede on price!
+            has_volume_commitment = "volume" in concession_text or "volume" in rationale_text or "repeat" in rationale_text
+            if has_volume_commitment:
+                # Softens moderately: provides $1.50 volume discount and lowers shipping to $100
+                new_price = round(max(c.min_unit_price, r1_offer.unit_price - 1.50), 2)
+                return CommercialOffer(
+                    unit_price=new_price,
+                    total_price=round(new_price * self.qty + 100.0, 2),
+                    quantity=self.qty,
+                    delivery_days=9,
+                    warranty_months=12,
+                    shipping_cost=100.0,
+                    payment_terms="Net 30",
+                    special_concessions=["Volume Rebate of $1.50/unit"],
+                )
+            else:
+                # Firm refusal: Does NOT concede price without volume commitment!
+                return CommercialOffer(
+                    unit_price=r1_offer.unit_price,
+                    total_price=r1_offer.total_price,
+                    quantity=self.qty,
+                    delivery_days=r1_offer.delivery_days,
+                    warranty_months=r1_offer.warranty_months,
+                    shipping_cost=r1_offer.shipping_cost,
+                    payment_terms=r1_offer.payment_terms,
+                    special_concessions=["Price Firm — Volume Commitment Required for Discounts"],
+                )
+
         elif seller_key == "seller_b":
-            # Value defender holds firm on price, but upgrades warranty to 24 mos and waives shipping to $0
+            # The Value Defender:
+            # Resists direct unit price cut, but upgrades warranty to 24 months and absorbs shipping to protect margin
             return CommercialOffer(
                 unit_price=r1_offer.unit_price,
                 total_price=round(r1_offer.unit_price * self.qty, 2),
@@ -554,7 +744,8 @@ class NegotiationEngine:
                 special_concessions=["Extended 24-Month Warranty", "Free Freight Shipping"],
             )
         else:  # seller_c
-            # Strategic flexible negotiator provides Net 60 payment terms, 5-day delivery, and free shipping
+            # The Strategic Flexible Negotiator:
+            # Flexes on delivery lead time, Net 60 terms, and free shipping
             new_price = round(max(c.min_unit_price, r1_offer.unit_price - 1.00), 2)
             return CommercialOffer(
                 unit_price=new_price,
@@ -563,6 +754,6 @@ class NegotiationEngine:
                 delivery_days=5,
                 warranty_months=12,
                 shipping_cost=0.0,  # Free shipping
-                payment_terms="Net 60",  # Better payment terms
+                payment_terms="Net 60",
                 special_concessions=["Expedited 5-Day Delivery", "Net 60 Terms", "Free Shipping"],
             )

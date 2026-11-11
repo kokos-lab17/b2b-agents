@@ -92,6 +92,18 @@ class TestPayPalAndAPI(unittest.TestCase):
         response = self.client.get("/api/confirm-payment?token=invalid!!!")
         self.assertEqual(response.status_code, 400)
 
+    def test_confirm_payment_rejects_unregistered_demo_token(self):
+        """Reject demo tokens unless they match an active demo transaction (Feature 5)."""
+        response = self.client.get("/api/confirm-payment?token=DEMO-FAKE1234567")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not match active pending order", response.json()["detail"])
+
+    def test_confirm_payment_rejects_unmatched_paypal_token(self):
+        """Reject PayPal token that does not match the active pending order."""
+        response = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not match active pending order", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

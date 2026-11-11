@@ -93,6 +93,7 @@ class GroqClient:
         last_error = None
 
         for attempt in range(1, self.max_retries + 1):
+            self.check_budget(agent_name)
             try:
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.post(
