@@ -238,22 +238,12 @@ def run_procurement(
         context=[compare_task],
     )
 
-    def on_task_end(task, output, agent):
-        events.append({
-            "step": len(events) + 1,
-            "agent": agent.role if hasattr(agent, 'role') else str(agent),
-            "message": str(output.raw)[:500],
-            "offer": None,
-            "status": "negotiating"
-        })
-
     crew = Crew(
-        agents=all_agents,
-        tasks=all_tasks,
-        process=Process.sequential,
-        verbose=True,
-        task_callback=on_task_end
-    )   
+    agents=[buyer] + sellers + [order_agent],
+    tasks=neg_tasks + [compare_task, order_task],
+    process=Process.sequential,
+    verbose=True,
+    )
     result = crew.kickoff()
     return {
         "raw": getattr(result, "raw", str(result)),
