@@ -4,7 +4,7 @@ python-dotenv==1.0.1
 pydantic>=2.10,<3.0.0
 langchain==0.3.23
 langchain-core==0.3.62
-openai==1.54.0
+openai==1.66.0
 langchain-google-genai==2.0.0
 crewai==0.76.2
 crewai-tools==0.13.2
