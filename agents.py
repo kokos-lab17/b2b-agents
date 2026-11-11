@@ -19,7 +19,7 @@ toolkit = PayPalToolkit(
     ),
 )
 tools = toolkit.get_tools()
-llm = "gemini/gemini-3.5-flash-lite"   
+llm = "groq/openai/gpt-oss-120b"      
 FALLBACK_VENDORS = [
     {"name": "Vendor A", "floor": 50, "style": "aggressive", "specialty": "general"},
     {"name": "Vendor B", "floor": 55, "style": "conservative", "specialty": "premium"},
