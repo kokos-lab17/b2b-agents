@@ -19,12 +19,7 @@ toolkit = PayPalToolkit(
     ),
 )
 tools = toolkit.get_tools()
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    temperature=0.4,
-    api_key=os.getenv("GEMINI_API_KEY"),
-)
-
+llm = "gemini/gemini-2.0-flash"   
 FALLBACK_VENDORS = [
     {"name": "Vendor A", "floor": 50, "style": "aggressive", "specialty": "general"},
     {"name": "Vendor B", "floor": 55, "style": "conservative", "specialty": "premium"},
