@@ -173,6 +173,24 @@ def record_deal_accepted(
             conn.close()
 
 
+def get_transaction(
+    order_id: str, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """Retrieve transaction details by order_id."""
+    with _db_lock:
+        conn = _get_connection(db_path)
+        try:
+            with conn:
+                cur = conn.execute(
+                    "SELECT session_id, order_id, supplier_name, amount, status, created_at, captured_at FROM transactions WHERE order_id = ?;",
+                    (order_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+
+
 def record_payment_captured(
     order_id: str, db_path: str | None = None
 ) -> bool:
@@ -184,7 +202,7 @@ def record_payment_captured(
                 now = datetime.now(timezone.utc).isoformat()
                 cur = conn.execute("""
                     UPDATE transactions
-                    SET status = 'captured', captured_at = ?
+                    SET status = 'captured', captured_at = COALESCE(captured_at, ?)
                     WHERE order_id = ?;
                 """, (now, order_id))
                 if cur.rowcount > 0:

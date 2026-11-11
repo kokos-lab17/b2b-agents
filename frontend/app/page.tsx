@@ -112,24 +112,28 @@ function StatusCell(props: { value?: string }) {
   const status = props.value || '';
   const cls = STATUS_STYLES[status];
   if (!cls) {
-    return <span className="text-gray-400">{status || '—'}</span>;
+    return <div className="py-2.5 text-gray-400">{status || '—'}</div>;
   }
   return (
-    <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
-      {status.replace(/_/g, ' ')}
-    </span>
+    <div className="py-2.5">
+      <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${cls}`}>
+        {status.replace(/_/g, ' ')}
+      </span>
+    </div>
   );
 }
 
 function StrategyCell(props: { value?: string | null }) {
   const strategy = props.value;
   if (!strategy) {
-    return <span className="text-gray-500">—</span>;
+    return <div className="py-2.5 text-gray-500">—</div>;
   }
   return (
-    <span className="inline-block rounded border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 text-xs font-medium text-purple-300">
-      {strategy.replace(/_/g, ' ')}
-    </span>
+    <div className="py-2.5">
+      <span className="inline-block rounded border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 text-[11px] font-medium text-purple-300">
+        {strategy.replace(/_/g, ' ')}
+      </span>
+    </div>
   );
 }
 
@@ -137,37 +141,86 @@ function AgentCell(props: { value?: string }) {
   const v = props.value || '';
   const isBuyer = v.includes('Buyer');
   return (
-    <span
+    <div
       title={v}
-      className={`block truncate font-medium ${isBuyer ? 'text-blue-400' : 'text-gray-200'}`}
-      style={{ lineHeight: '34px' }}
+      className={`py-2.5 text-xs font-semibold leading-snug whitespace-normal break-words ${
+        isBuyer ? 'text-blue-400' : 'text-gray-200'
+      }`}
     >
       {v}
-    </span>
+    </div>
   );
 }
 
+/**
+ * Strips redundant persona bracket prefixes (e.g. '[The Hard Bargainer]', '[The Value Defender]',
+ * '[The Strategic Flexible Negotiator]', '[Willing to Bargain]') from dialogue text, preserving
+ * '[DEMO SIMULATION]' if present while keeping company names and commercial details intact.
+ */
+function cleanDialogueMessage(raw: string): string {
+  if (!raw) return '';
+  let text = raw.trim();
+  const hasDemo = text.startsWith('[DEMO SIMULATION]');
+  if (hasDemo) {
+    text = text.replace(/^\[DEMO SIMULATION\]\s*/i, '');
+  }
+  // Strip redundant bracketed persona names while preserving message content
+  text = text.replace(
+    /^\[(The\s+)?(Hard Bargainer|Value Defender|Strategic Flexible Negotiator|Willing to Bargain|Strategic Negotiator|Competitive Seller|Bargainer|Defender|Negotiator|Autonomous Buyer Agent|Buyer Agent)[^\]]*\]\s*:?\s*/i,
+    ''
+  );
+  text = text.trim();
+  return hasDemo ? `[DEMO] ${text}` : text;
+}
+
 function MessageCell(props: { value?: string }) {
-  const v = props.value || '';
+  const v = cleanDialogueMessage(props.value || '');
   return (
-    <span title={v} className="block truncate text-gray-300" style={{ lineHeight: '34px' }}>
+    <div className="py-2.5 text-xs leading-relaxed text-gray-300 whitespace-normal break-words">
       {v}
-    </span>
+    </div>
   );
 }
 
 function OfferCell(props: { value?: number | null }) {
   if (props.value === null || props.value === undefined) {
-    return <span className="text-gray-500">—</span>;
+    return <div className="py-2.5 text-gray-500">—</div>;
   }
-  return <span className="tabular-nums font-semibold text-emerald-400">${Number(props.value).toFixed(2)}</span>;
+  return (
+    <div className="py-2.5 tabular-nums font-semibold text-emerald-400">
+      ${Number(props.value).toFixed(2)}
+    </div>
+  );
 }
 
 function StepCell(props: { value?: number | null }) {
   if (props.value === null || props.value === undefined) {
-    return <span className="text-gray-500">—</span>;
+    return <div className="py-2.5 text-gray-500">—</div>;
   }
-  return <span className="tabular-nums text-gray-400">{props.value}</span>;
+  return <div className="py-2.5 tabular-nums text-gray-400">{props.value}</div>;
+}
+
+function getStoredOrderId(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return sessionStorage.getItem('pending_paypal_order_id');
+  } catch {
+    return null;
+  }
+}
+
+function setStoredOrderId(id: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.setItem('pending_paypal_order_id', id);
+  } catch {}
+}
+
+function removeStoredOrderId(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem('pending_paypal_order_id');
+  } catch {}
 }
 
 const BUTTON_LABELS: Record<Phase, string> = {
@@ -195,36 +248,36 @@ export default function Home() {
   const [orderId, setOrderId] = useState<string | null>(null);
   const [approveUrl, setApproveUrl] = useState<string | null>(null);
   const [captured, setCaptured] = useState(false);
+  const [paypalNotice, setPaypalNotice] = useState<string | null>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollInFlightRef = useRef(false);
   const confirmingRef = useRef(false);
   const mountedRef = useRef(true);
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
-  }, []);
-
   const columnDefs: ColDef[] = [
-    { field: 'step', headerName: '#', width: 50, cellRenderer: StepCell },
-    { field: 'agent', headerName: 'Agent Persona', width: 180, cellRenderer: AgentCell },
-    { field: 'strategy', headerName: 'Buyer Strategy', width: 220, cellRenderer: StrategyCell },
+    { field: 'step', headerName: '#', width: 55, cellRenderer: StepCell },
+    {
+      field: 'agent',
+      headerName: 'Agent Persona',
+      width: 175,
+      wrapText: true,
+      autoHeight: true,
+      cellRenderer: AgentCell,
+    },
+    { field: 'strategy', headerName: 'Buyer Strategy', width: 210, cellRenderer: StrategyCell },
     {
       field: 'message',
-      headerName: 'Explainable Negotiation Dialogue',
-      flex: 1,
-      minWidth: 320,
+      headerName: 'Negotiation Dialogue',
+      flex: 2,
+      minWidth: 440,
+      wrapText: true,
+      autoHeight: true,
       cellRenderer: MessageCell,
     },
-    { field: 'offer', headerName: 'Offer $', width: 100, cellRenderer: OfferCell },
-    { field: 'status', headerName: 'Status', width: 140, cellRenderer: StatusCell },
+    { field: 'offer', headerName: 'Offer $', width: 95, cellRenderer: OfferCell },
+    { field: 'status', headerName: 'Status', width: 135, cellRenderer: StatusCell },
   ];
 
   const stopPolling = useCallback(() => {
@@ -308,6 +361,91 @@ export default function Home() {
     }
   }, [applyStatusResponse]);
 
+  const executePaymentCapture = useCallback(
+    async (tokenToCapture: string) => {
+      if (confirmingRef.current) return;
+      confirmingRef.current = true;
+      setIsCapturing(true);
+      setError('');
+      setPaypalNotice(`Capturing PayPal Sandbox payment for order ${tokenToCapture}...`);
+
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 35000);
+        try {
+          const res = await fetch(
+            `${BACKEND_URL}/api/confirm-payment?token=${encodeURIComponent(tokenToCapture)}`,
+            { signal: controller.signal }
+          );
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data?.detail || 'PayPal payment capture was rejected by server.');
+          }
+          removeStoredOrderId();
+          setCaptured(true);
+          setPhase('completed');
+          setPaypalNotice(null);
+          if (typeof window !== 'undefined') {
+            window.history.replaceState({}, document.title, window.location.pathname);
+          }
+          // Fetch status once to update the events table and backend status
+          try {
+            const statusRes = await fetch(`${BACKEND_URL}/api/status`, { cache: 'no-store' });
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              if (mountedRef.current && statusData) {
+                applyStatusResponse(statusData);
+              }
+            }
+          } catch {}
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (err: any) {
+        setError(err?.message || 'Payment confirmation failed. Please try again.');
+        setPaypalNotice(null);
+      } finally {
+        setIsCapturing(false);
+        confirmingRef.current = false;
+      }
+    },
+    [applyStatusResponse]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    // Detect PayPal Sandbox return or cancellation via URL parameters
+    if (typeof window !== 'undefined') {
+      const urlParams = new URLSearchParams(window.location.search);
+      const isCancelled = urlParams.get('paypal_cancel') === 'true';
+      const isReturn = urlParams.get('paypal_return') === 'true';
+      const tokenParam = urlParams.get('token');
+      const storedToken = getStoredOrderId();
+
+      if (isCancelled) {
+        setPaypalNotice(
+          'PayPal checkout was cancelled. You can review the negotiated deal and approve or restart anytime.'
+        );
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } else if (isReturn || tokenParam) {
+        const activeToken = tokenParam || storedToken;
+        if (activeToken) {
+          setOrderId(activeToken);
+          executePaymentCapture(activeToken);
+        }
+      }
+    }
+
+    return () => {
+      mountedRef.current = false;
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [executePaymentCapture]);
+
   const startPolling = useCallback(() => {
     stopPolling();
     pollStatus();
@@ -384,37 +522,20 @@ export default function Home() {
   };
 
   const openApprove = (url: string) => {
-    window.open(url, '_blank', 'noopener,noreferrer');
+    if (orderId) {
+      setStoredOrderId(orderId);
+    }
+    // Redirect so PayPal return redirect returns cleanly to the deployed application
+    window.location.href = url;
   };
 
   const confirmPayment = async () => {
-    if (!orderId) {
+    const tokenToConfirm = orderId || getStoredOrderId();
+    if (!tokenToConfirm) {
       setError('No PayPal order to confirm yet.');
       return;
     }
-    confirmingRef.current = true;
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
-      try {
-        const res = await fetch(
-          `${BACKEND_URL}/api/confirm-payment?token=${encodeURIComponent(orderId)}`,
-          { signal: controller.signal }
-        );
-        if (!res.ok) {
-          confirmingRef.current = false;
-          setError('Payment confirmation failed. Please try again.');
-          return;
-        }
-        setPhase('running');
-        startPolling();
-      } finally {
-        clearTimeout(timeout);
-      }
-    } catch {
-      confirmingRef.current = false;
-      setError('Payment confirmation failed. Please try again.');
-    }
+    await executePaymentCapture(tokenToConfirm);
   };
 
   const running = phase === 'running';
@@ -581,6 +702,30 @@ export default function Home() {
         </div>
       )}
 
+      {/* PayPal Notice (e.g. cancellation or auto-capture status) */}
+      {paypalNotice && (
+        <div className="mt-6 flex items-center justify-between rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-3 text-sm text-yellow-300 shadow-md">
+          <div className="flex items-center gap-2">
+            {isCapturing && (
+              <svg className="h-4 w-4 animate-spin text-yellow-300" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+            )}
+            <span>{paypalNotice}</span>
+          </div>
+          {!isCapturing && (
+            <button
+              onClick={() => setPaypalNotice(null)}
+              className="text-gray-400 transition-colors hover:text-white"
+              aria-label="Dismiss notice"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      )}
+
       {phase === 'failed' && !error && (
         <div className="mt-6 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400">
           The procurement run failed. Please verify credentials or retry in Demo mode.
@@ -683,20 +828,21 @@ export default function Home() {
           </h2>
           <span className="text-xs text-gray-500">Autonomous adaptive turn protocol</span>
         </div>
-        <div
-          className="ag-theme-alpine-dark rounded-xl border border-gray-800 shadow-md"
-          style={{ height: 480, width: '100%' }}
-        >
-          <AgGridReact
-            rowData={rowData}
-            columnDefs={columnDefs}
-            defaultColDef={{ sortable: false, filter: false, resizable: true }}
-            getRowId={(params) => String(params.data.step ?? params.data.agent)}
-            theme="legacy"
-            headerHeight={44}
-            rowHeight={44}
-            suppressCellFocus={true}
-          />
+        <div className="overflow-x-auto rounded-xl border border-gray-800 shadow-md">
+          <div
+            className="ag-theme-alpine-dark"
+            style={{ height: 500, width: '100%', minWidth: 920 }}
+          >
+            <AgGridReact
+              rowData={rowData}
+              columnDefs={columnDefs}
+              defaultColDef={{ sortable: false, filter: false, resizable: true }}
+              getRowId={(params) => String(params.data.step ?? params.data.agent)}
+              theme="legacy"
+              headerHeight={44}
+              suppressCellFocus={true}
+            />
+          </div>
         </div>
       </section>
 
@@ -758,20 +904,38 @@ export default function Home() {
             <div className="mt-4 flex flex-wrap items-center gap-3">
               <button
                 onClick={() => openApprove(approveUrl)}
-                className="rounded-md bg-green-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-green-500"
+                disabled={isCapturing}
+                className="rounded-md bg-green-600 px-5 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-green-500 disabled:opacity-50"
               >
                 Approve on PayPal Sandbox
               </button>
+              <a
+                href={approveUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => {
+                  if (orderId) setStoredOrderId(orderId);
+                }}
+                className="rounded-md border border-gray-700 bg-gray-800/80 px-4 py-2.5 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700 hover:text-white"
+              >
+                Open in New Tab ↗
+              </a>
               <button
                 onClick={confirmPayment}
-                disabled={!orderId}
-                className="rounded-md border border-blue-500/50 bg-blue-600/20 px-5 py-2.5 text-sm font-semibold text-blue-300 shadow-md transition-colors hover:bg-blue-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!orderId || isCapturing}
+                className="inline-flex items-center gap-2 rounded-md border border-blue-500/50 bg-blue-600/20 px-5 py-2.5 text-sm font-semibold text-blue-300 shadow-md transition-colors hover:bg-blue-600/40 disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {isCapturing && (
+                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                  </svg>
+                )}
                 Confirm Payment & Settle
               </button>
             </div>
             <p className="mt-2 text-xs text-gray-400">
-              Credentials remain strictly on the backend server. Payment capture requires your approval step.
+              Credentials remain strictly on the backend server. Payment capture completes automatically upon approval return or manual confirmation.
             </p>
           </div>
         </section>

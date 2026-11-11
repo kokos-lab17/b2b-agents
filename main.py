@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.config import settings
-from backend.memory import record_payment_captured
+from backend.memory import get_transaction, record_payment_captured
 from backend.negotiation import NegotiationEngine
 from backend.paypal import PayPalClient, PayPalError
 
@@ -167,12 +167,19 @@ async def confirm_payment(token: str):
     with _lock:
         expected_order_id = order_id
 
-    # Security check: Reject tokens unless they match the active pending order
-    if not expected_order_id or token != expected_order_id:
+    tx = get_transaction(token)
+
+    # Security check: Reject tokens unless they match the active pending order or exist in DB
+    if not (expected_order_id and token == expected_order_id) and not tx:
         raise HTTPException(
             status_code=400,
             detail=f"Token mismatch: Provided token '{token}' does not match active pending order '{expected_order_id}'",
         )
+
+    # Idempotent capture: if already captured, return success immediately
+    if tx and tx.get("status") == "captured":
+        status = "captured"
+        return {"status": "captured", "order_id": token, "already_captured": True}
 
     if token.startswith("DEMO-"):
         # Simulated demo capture: Only succeeds if active record exists and was updated
@@ -180,7 +187,7 @@ async def confirm_payment(token: str):
         if not captured:
             raise HTTPException(
                 status_code=400,
-                detail=f"No pending transaction found matching demo token '{token}' or already captured.",
+                detail=f"No pending transaction found matching demo token '{token}'.",
             )
         status = "captured"
         _append_event(

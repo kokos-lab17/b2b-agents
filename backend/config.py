@@ -36,6 +36,7 @@ class Settings:
 
     # CORS and Host
     FRONTEND_ALLOWED_ORIGIN: str = os.getenv("FRONTEND_ALLOWED_ORIGIN", "*").strip()
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 
 
 settings = Settings()

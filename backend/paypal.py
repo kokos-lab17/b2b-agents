@@ -20,10 +20,14 @@ class PayPalClient:
         client_id: str | None = None,
         secret: str | None = None,
         base_url: str | None = None,
+        frontend_url: str | None = None,
     ):
         self.client_id = client_id or settings.PAYPAL_CLIENT_ID
         self.secret = secret or settings.PAYPAL_CLIENT_SECRET
         self.base_url = (base_url or settings.PAYPAL_BASE_URL).rstrip("/")
+        self.frontend_url = (
+            frontend_url if frontend_url is not None else settings.FRONTEND_URL
+        ).strip().rstrip("/")
         self.timeout = settings.REQUEST_TIMEOUT_SECONDS
 
     def is_configured(self) -> bool:
@@ -65,6 +69,16 @@ class PayPalClient:
             raise PayPalError(
                 f"Cannot create order: Invalid terms (unit_price={offer.unit_price}, qty={qty})"
             )
+
+        if not self.frontend_url:
+            raise PayPalError(
+                "FRONTEND_URL environment variable is not configured. "
+                "Please set FRONTEND_URL to your deployed frontend domain (e.g. https://your-frontend.netlify.app)."
+            )
+
+        base_url = self.frontend_url.rstrip("/")
+        return_url = f"{base_url}/?paypal_return=true"
+        cancel_url = f"{base_url}/?paypal_cancel=true"
 
         token = self._get_access_token()
         total_amount = round(offer.unit_price * qty + offer.shipping_cost, 2)
@@ -108,8 +122,8 @@ class PayPalClient:
                 "brand_name": "Autonomous B2B Procurement",
                 "landing_page": "BILLING",
                 "user_action": "PAY_NOW",
-                "return_url": "https://example.com/return",
-                "cancel_url": "https://example.com/cancel",
+                "return_url": return_url,
+                "cancel_url": cancel_url,
             },
         }
 
@@ -149,7 +163,7 @@ class PayPalClient:
             raise PayPalError(f"PayPal order creation failed: {exc}") from exc
 
     def capture_order(self, order_id: str) -> dict[str, Any]:
-        """Capture an approved PayPal order."""
+        """Capture an approved PayPal order. Handles already-captured idempotent states."""
         token = self._get_access_token()
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -160,10 +174,23 @@ class PayPalClient:
                         "Content-Type": "application/json",
                     },
                 )
+                if resp.status_code == 422:
+                    try:
+                        err_data = resp.json()
+                        details = err_data.get("details", [])
+                        if any(d.get("issue") == "ORDER_ALREADY_CAPTURED" for d in details) or "ORDER_ALREADY_CAPTURED" in resp.text:
+                            logger.info(
+                                "Order %s was already captured via PayPal Sandbox; treating as completed idempotently.",
+                                order_id,
+                            )
+                            return {"id": order_id, "status": "COMPLETED", "already_captured": True}
+                    except Exception:
+                        pass
+
                 resp.raise_for_status()
                 data = resp.json()
                 status = data.get("status")
-                if status != "COMPLETED":
+                if status not in ("COMPLETED", "APPROVED"):
                     raise PayPalError(
                         f"PayPal capture failed: Order status is {status}, expected COMPLETED."
                     )
