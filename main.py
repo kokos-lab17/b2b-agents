@@ -1,132 +1,70 @@
+"""Main FastAPI application for Autonomous Multi-Agent B2B Procurement."""
 import asyncio
+import logging
 import re
 import threading
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from agents import capture_payment, run_procurement
+from backend.config import settings
+from backend.memory import record_payment_captured
+from backend.negotiation import NegotiationEngine
+from backend.paypal import PayPalClient, PayPalError
 
-app = FastAPI(title="Agentic B2B Commerce")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
+
+app = FastAPI(title="Autonomous Multi-Agent B2B Procurement")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[settings.FRONTEND_ALLOWED_ORIGIN] if settings.FRONTEND_ALLOWED_ORIGIN != "*" else ["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-events: list[dict] = []
+# In-memory shared state for active run
+events: list[dict[str, Any]] = []
 order_id: str | None = None
 approve_url: str | None = None
 status: str = "idle"
-current_vendors: list = []
+current_vendors: list[dict[str, Any]] = []
+current_deal: dict[str, Any] | None = None
+current_token_usage: dict[str, Any] | None = None
 
 _lock = threading.Lock()
 _generation = 0
 
-_OFFER_RE = re.compile(
-    r"\$\s*(\d+(?:\.\d+)?)\s*(?:/|per)\s*unit",
-    re.IGNORECASE,
-)
-_ANY_MONEY_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
-_ORDER_ID_RE = re.compile(r"\b([A-Z0-9]{17,32})\b")
-_URL_RE = re.compile(r"https?://[^\s\)\]\"'<>]+")
-
 
 class StartRequest(BaseModel):
-    product: str = Field(min_length=1)
-    qty: int = Field(gt=0)
-    budget: float = Field(gt=0)
+    product: str = Field(..., min_length=1)
+    qty: int = Field(..., gt=0)
+    budget: float = Field(..., gt=0)
+    demo_mode: bool = False
 
 
-def _append(event: dict, generation: int | None = None) -> None:
+def _append_event(event: dict[str, Any], generation: int | None = None) -> None:
     with _lock:
         if generation is not None and generation != _generation:
             return
-        event["step"] = len(events) + 1
+        if "step" not in event:
+            event["step"] = len(events) + 1
         events.append(event)
 
 
-def _step_message(step) -> str:
-    if isinstance(step, str):
-        return step
-    if isinstance(step, dict):
-        for key in ("text", "log", "output", "raw"):
-            value = step.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-        return str(step)
-    for attr in ("text", "log", "output", "raw"):
-        value = getattr(step, attr, None)
-        if isinstance(value, str) and value.strip():
-            return value
-    return str(step)
+def _run_procurement_worker(
+    product: str, qty: int, budget: float, demo_mode: bool, generation: int
+) -> None:
+    global order_id, approve_url, status, current_vendors, current_deal, current_token_usage
 
+    def on_event(evt: dict[str, Any]) -> None:
+        _append_event(evt, generation)
 
-def _extract_offer(message: str) -> float | None:
-    match = _OFFER_RE.search(message) or _ANY_MONEY_RE.search(message)
-    if not match:
-        return None
-    return float(match.group(1))
-
-
-def _parse_order(text: str) -> tuple[str | None, str | None]:
-    approve = None
-    for match in re.finditer(r"\{[^{}]*\}", text):
-        block = match.group(0)
-        if re.search(r'"rel"\s*:\s*"approve"', block):
-            href = re.search(r'"href"\s*:\s*"([^"]+)"', block)
-            if href:
-                approve = href.group(1).replace("\\u0026", "&")
-                break
-    if approve is None:
-        for url in _URL_RE.findall(text):
-            cleaned = url.rstrip(".,")
-            if "paypal.com" in cleaned or "token=" in cleaned:
-                approve = cleaned
-                break
-
-    parsed_id = None
-    labeled = re.search(
-        r"order[_\s-]?id\s*[:=]\s*['\"]?([A-Z0-9]{17,32})",
-        text,
-        re.IGNORECASE,
-    )
-    if labeled:
-        parsed_id = labeled.group(1)
-    else:
-        id_field = re.search(r'"id"\s*:\s*"([A-Z0-9]{17,32})"', text)
-        if id_field:
-            parsed_id = id_field.group(1)
-        else:
-            any_id = _ORDER_ID_RE.search(text)
-            if any_id:
-                parsed_id = any_id.group(1)
-
-    if parsed_id is None and approve and "token=" in approve:
-        token = approve.split("token=", 1)[1].split("&", 1)[0]
-        if _ORDER_ID_RE.fullmatch(token):
-            parsed_id = token
-    return parsed_id, approve
-
-
-async def _run_procurement(product: str, qty: int, budget: float, generation: int) -> None:
-    global order_id, approve_url, status, current_vendors
-
-    def on_step(role: str, step) -> None:
-        message = _step_message(step)
-        _append(
-            {
-                "agent": role,
-                "message": message,
-                "offer": _extract_offer(message),
-                "status": "negotiating",
-            },
-            generation,
-        )
-
-    def on_vendors(vendors: list) -> None:
+    def on_vendors(vendors: list[dict[str, Any]]) -> None:
         global current_vendors
         with _lock:
             if generation != _generation:
@@ -134,97 +72,147 @@ async def _run_procurement(product: str, qty: int, budget: float, generation: in
             current_vendors = vendors
 
     try:
-        result = await asyncio.to_thread(
-            run_procurement,
-            product,
-            qty,
-            budget,
-            on_step,
-            on_vendors,
+        engine = NegotiationEngine(
+            product=product,
+            qty=qty,
+            budget=budget,
+            demo_mode=demo_mode,
+            on_event=on_event,
+            on_vendors=on_vendors,
         )
-    except Exception as exc:
+        result = engine.run()
+
         with _lock:
             if generation != _generation:
                 return
-            status = "error"
-        _append(
+            order_id = result.get("order_id")
+            approve_url = result.get("approve_url")
+            status = result.get("status", "completed")
+            current_deal = result.get("deal")
+            current_token_usage = result.get("token_usage")
+            if result.get("vendors"):
+                current_vendors = result["vendors"]
+
+    except Exception as exc:
+        logger.exception("Procurement execution failed")
+        with _lock:
+            if generation != _generation:
+                return
+            status = "failed"
+        _append_event(
             {
                 "agent": "System",
                 "message": f"Procurement failed: {exc}",
                 "offer": None,
-                "status": "error",
+                "status": "failed",
+                "event_type": "failed",
             },
             generation,
         )
-        return
-
-    transcript = f"{result.get('raw', '')}\n{result.get('transcript', '')}"
-    parsed_id, parsed_url = _parse_order(transcript)
-    with _lock:
-        if generation != _generation:
-            return
-        order_id = parsed_id
-        approve_url = parsed_url
-        status = "awaiting_approval"
-        if result.get("vendors"):
-            current_vendors = result["vendors"]
-    _append(
-        {
-            "agent": "System",
-            "message": "Order created. Awaiting buyer approval.",
-            "approve_url": approve_url,
-            "status": "awaiting_approval",
-        },
-        generation,
-    )
 
 
 @app.post("/api/start")
 async def start(body: StartRequest):
-    global events, order_id, approve_url, status, current_vendors, _generation
+    """Initiates an autonomous procurement session."""
+    global events, order_id, approve_url, status, current_vendors, current_deal, current_token_usage, _generation
     _generation += 1
     generation = _generation
+
     with _lock:
         events = []
         current_vendors = []
+        current_deal = None
+        current_token_usage = None
     order_id = None
     approve_url = None
     status = "negotiating"
-    asyncio.create_task(
-        _run_procurement(body.product, body.qty, body.budget, generation)
+
+    thread = threading.Thread(
+        target=_run_procurement_worker,
+        args=(body.product, body.qty, body.budget, body.demo_mode, generation),
+        daemon=True,
     )
+    thread.start()
     return {"status": "started"}
 
 
 @app.get("/api/status")
 async def get_status():
+    """Returns current procurement events, vendors, deal details, and approval info."""
     with _lock:
         snapshot = list(events)
         vendors = list(current_vendors)
+        deal_snap = dict(current_deal) if current_deal else None
+        usage_snap = dict(current_token_usage) if current_token_usage else None
+
     return {
         "events": snapshot,
         "order_id": order_id,
         "approve_url": approve_url,
         "status": status,
         "vendors": vendors,
+        "deal": deal_snap,
+        "token_usage": usage_snap,
     }
 
 
 @app.get("/api/confirm-payment")
 async def confirm_payment(token: str):
+    """Validates order token, captures approved PayPal Sandbox payment, and updates memory."""
     global status
-    if not re.fullmatch(r"[A-Z0-9]{17,32}", token):
-        raise HTTPException(status_code=400, detail="token must be a PayPal order id")
+    # Match valid PayPal order ID or DEMO ID
+    if not (re.fullmatch(r"[A-Z0-9]{17,32}", token) or token.startswith("DEMO-")):
+        raise HTTPException(status_code=400, detail="token must be a valid PayPal order id")
+
+    with _lock:
+        expected_order_id = order_id
+
+    # Security check: Validate the capture token against the current pending order
+    if expected_order_id and token != expected_order_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token mismatch: Provided token '{token}' does not match pending order '{expected_order_id}'",
+        )
+
+    if token.startswith("DEMO-"):
+        # Simulated demo capture
+        record_payment_captured(token)
+        status = "captured"
+        _append_event(
+            {
+                "agent": "System",
+                "message": "[DEMO SIMULATION] Payment captured in demo mode. Transaction recorded in persistent memory.",
+                "status": "captured",
+                "event_type": "payment_captured",
+            }
+        )
+        return {"status": "captured", "order_id": token, "mode": "demo"}
+
+    # Live PayPal Capture
     try:
-        await asyncio.to_thread(capture_payment, token)
-    except Exception as exc:
+        client = PayPalClient()
+        await asyncio.to_thread(client.capture_order, token)
+        record_payment_captured(token)
+    except PayPalError as exc:
+        logger.error("PayPal capture error: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error capturing payment: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     status = "captured"
-    _append(
+    _append_event(
         {
             "agent": "System",
-            "message": "Payment captured. Transaction complete.",
+            "message": "Payment captured. Transaction complete and settled via PayPal Sandbox.",
             "status": "captured",
+            "event_type": "payment_captured",
         }
     )
     return {"status": "captured", "order_id": token}
+
+
+@app.get("/api/health")
+async def health():
+    """Health check endpoint for deployment monitoring."""
+    return {"status": "healthy", "service": "b2b-agents-backend"}
