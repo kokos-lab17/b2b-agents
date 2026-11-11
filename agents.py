@@ -239,13 +239,13 @@ def run_procurement(
     )
 
     def on_task_end(task, output, agent):
-    events.append({
-        "step": len(events) + 1,
-        "agent": agent.role if hasattr(agent, 'role') else str(agent),
-        "message": str(output.raw)[:500],
-        "offer": None,
-        "status": "negotiating"
-    })
+        events.append({
+            "step": len(events) + 1,
+            "agent": agent.role if hasattr(agent, 'role') else str(agent),
+            "message": str(output.raw)[:500],
+            "offer": None,
+            "status": "negotiating"
+        })
 
     crew = Crew(
         agents=all_agents,
