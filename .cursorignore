@@ -1,0 +1,7 @@
+# Build artifacts (AI doesn't need to read compiled output)
+.next/
+dist/
+build/
+
+# Large generated files
+*.lock   
