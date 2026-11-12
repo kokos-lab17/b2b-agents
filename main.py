@@ -177,6 +177,7 @@ def _run_procurement_worker(
     payment_mode: PaymentMode | None,
     buyer_id: str,
     preferences: BuyerPreferences | None,
+    specifications: str = "",
 ) -> None:
     """Background worker executing the negotiation engine for a specific session."""
     logger.info("[%s] Stage 2: Worker started.", session_id)
@@ -209,6 +210,7 @@ def _run_procurement_worker(
             payment_mode=payment_mode,
             buyer_id=buyer_id,
             preferences=preferences,
+            specifications=specifications,
             session_id=session_id,
             on_event=on_event,
             on_vendors=on_vendors,
@@ -326,6 +328,13 @@ async def start(body: StartRequest):
     if pay_mode is None:
         pay_mode = PaymentMode.SIMULATED if body.demo_mode else PaymentMode.PAYPAL_SANDBOX
 
+    # Enforce PayPal Hackathon requirement: Live AI mode requires genuine PayPal Sandbox settlement
+    if neg_mode == NegotiationMode.LIVE_AI and pay_mode == PaymentMode.SIMULATED:
+        raise HTTPException(
+            status_code=400,
+            detail="Live AI negotiation requires genuine PayPal Sandbox authorization. Simulated settlement is not permitted in Live AI mode.",
+        )
+
     now_iso = datetime.now(timezone.utc).isoformat()
     logger.info(
         "[%s] Stage 1: Procurement request accepted. Product='%s', Qty=%d, Budget=$%.2f. Mode: %s/%s",
@@ -371,6 +380,7 @@ async def start(body: StartRequest):
             pay_mode,
             body.buyer_id,
             effective_preferences,
+            body.specifications,
         ),
         daemon=True,
     )

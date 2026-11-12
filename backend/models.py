@@ -213,6 +213,7 @@ class TokenUsageMetadata(BaseModel):
 class StartRequest(BaseModel):
     """Request payload to initiate procurement."""
     product: str = Field(..., min_length=1)
+    specifications: str = Field(default="", description="Detailed technical specifications or commercial requirements")
     qty: int = Field(..., gt=0)
     budget: float = Field(..., gt=0)
     negotiation_mode: NegotiationMode = Field(default=NegotiationMode.DEMO)

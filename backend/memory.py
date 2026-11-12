@@ -800,14 +800,23 @@ def get_overall_procurement_analytics(db_path: str | None = None) -> dict[str, A
                 cur = conn.execute("SELECT COUNT(*) as completed FROM procurement_sessions WHERE status = 'completed';")
                 completed_sessions = cur.fetchone()["completed"]
 
-                # 4. Total negotiated savings vs initial budget
+                # 4. Total unspent budget headroom vs initial budget
                 cur = conn.execute("""
-                    SELECT SUM((budget * qty) - total_cost) as total_savings
+                    SELECT SUM((budget * qty) - total_cost) as total_headroom
                     FROM procurement_sessions
                     WHERE status = 'completed' AND total_cost IS NOT NULL AND total_cost > 0;
                 """)
-                row_savings = cur.fetchone()
-                total_savings = round(row_savings["total_savings"], 2) if row_savings and row_savings["total_savings"] else 0.0
+                row_headroom = cur.fetchone()
+                total_headroom = round(row_headroom["total_headroom"], 2) if row_headroom and row_headroom["total_headroom"] else 0.0
+
+                # 5. Total negotiated price savings extracted through concessions
+                cur = conn.execute("""
+                    SELECT SUM(price_reduction) as total_cuts
+                    FROM strategy_records
+                    WHERE deal_won = 1 OR concession_obtained = 1;
+                """)
+                row_cuts = cur.fetchone()
+                total_negotiated_cuts = round(row_cuts["total_cuts"], 2) if row_cuts and row_cuts["total_cuts"] else 0.0
 
                 return {
                     "total_sandbox_spend": total_sandbox_spend,
@@ -816,7 +825,9 @@ def get_overall_procurement_analytics(db_path: str | None = None) -> dict[str, A
                     "simulated_orders_count": simulated_count,
                     "total_sessions": total_sessions,
                     "completed_sessions": completed_sessions,
-                    "total_savings": max(0.0, total_savings),
+                    "budget_headroom": max(0.0, total_headroom),
+                    "total_savings": max(0.0, total_headroom),  # compatibility
+                    "negotiated_price_savings": max(0.0, total_negotiated_cuts),
                 }
         finally:
             conn.close()

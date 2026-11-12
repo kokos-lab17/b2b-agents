@@ -562,6 +562,89 @@ class TestRegressionProcurementCompletion(unittest.TestCase):
             self.assertEqual(resp2.status_code, 400)
             self.assertIn("Currency mismatch", resp2.json()["detail"])
 
+    def test_22_reject_live_ai_simulated_settlement(self):
+        """22. /api/start rejects LIVE_AI + SIMULATED with HTTP 400."""
+        resp = self.client.post(
+            "/api/start",
+            json={
+                "product": "Turbine Components",
+                "qty": 50,
+                "budget": 500.0,
+                "negotiation_mode": "LIVE_AI",
+                "payment_mode": "SIMULATED",
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Live AI negotiation requires genuine PayPal Sandbox authorization", resp.json()["detail"])
+
+    def test_23_winner_diversity_lowest_price_favors_apex(self):
+        """23. Apex Industrial Corp wins when priority is LOWEST_PRICE on volume."""
+        from backend.models import BuyerPreferences, BuyerPreferencePriority
+        engine = NegotiationEngine(
+            product="Structural Bolts",
+            qty=300,
+            budget=100.0,
+            demo_mode=True,
+            preferences=BuyerPreferences(priority_type=BuyerPreferencePriority.LOWEST_PRICE),
+        )
+        res = engine.run()
+        self.assertEqual(res["winning_vendor"], "Apex Industrial Corp")
+
+    def test_24_winner_diversity_quality_warranty_favors_sterling(self):
+        """24. Sterling Quality Works wins when priority is QUALITY_WARRANTY."""
+        from backend.models import BuyerPreferences, BuyerPreferencePriority
+        engine = NegotiationEngine(
+            product="Medical Grade Sensors",
+            qty=100,
+            budget=100.0,
+            demo_mode=True,
+            preferences=BuyerPreferences(priority_type=BuyerPreferencePriority.QUALITY_WARRANTY),
+        )
+        res = engine.run()
+        self.assertEqual(res["winning_vendor"], "Sterling Quality Works")
+
+    def test_25_winner_diversity_fastest_delivery_favors_vanguard(self):
+        """25. Vanguard Logistics & Supply wins when priority is FASTEST_DELIVERY."""
+        from backend.models import BuyerPreferences, BuyerPreferencePriority
+        engine = NegotiationEngine(
+            product="Emergency Replacement Gaskets",
+            qty=100,
+            budget=100.0,
+            demo_mode=True,
+            preferences=BuyerPreferences(priority_type=BuyerPreferencePriority.FASTEST_DELIVERY),
+        )
+        res = engine.run()
+        self.assertEqual(res["winning_vendor"], "Vanguard Logistics & Supply")
+
+    def test_26_mandatory_constraints_disqualify_and_select_survivor(self):
+        """26. Mandatory constraints strictly disqualify non-compliant suppliers."""
+        from backend.models import BuyerPreferences, BuyerConstraints
+        # Constraint: min 20 months warranty. Apex (12m) & Vanguard (12m) disqualified -> Sterling wins!
+        engine = NegotiationEngine(
+            product="High Voltage Switchgear",
+            qty=50,
+            budget=200.0,
+            demo_mode=True,
+            preferences=BuyerPreferences(
+                constraints=BuyerConstraints(min_warranty_months=20)
+            ),
+        )
+        res = engine.run()
+        self.assertEqual(res["winning_vendor"], "Sterling Quality Works")
+
+        # Constraint: max 6 delivery days. Apex (10d) & Sterling (12d) disqualified -> Vanguard wins!
+        engine_fast = NegotiationEngine(
+            product="Conveyor Belts",
+            qty=50,
+            budget=200.0,
+            demo_mode=True,
+            preferences=BuyerPreferences(
+                constraints=BuyerConstraints(max_delivery_days=6)
+            ),
+        )
+        res_fast = engine_fast.run()
+        self.assertEqual(res_fast["winning_vendor"], "Vanguard Logistics & Supply")
+
 
 if __name__ == "__main__":
     unittest.main()

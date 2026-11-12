@@ -75,7 +75,7 @@ class PayPalClient:
                 "FRONTEND_URL environment variable is not configured. "
                 "Please set FRONTEND_URL to your deployed frontend domain (e.g. https://your-frontend.netlify.app)."
             )
-        if "b2b-agents.onrender.com" in self.frontend_url.lower():
+        if "b2b-agents.onrender.com" in self.frontend_url.lower() or "b2b-agents-secondary-branch.onrender.com" in self.frontend_url.lower():
             raise PayPalError(
                 "FRONTEND_URL cannot point to the backend Render service (b2b-agents.onrender.com). "
                 "Please set FRONTEND_URL to your deployed frontend domain."

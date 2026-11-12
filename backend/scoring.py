@@ -77,17 +77,17 @@ def score_offer(
     else:
         w = ScoringWeights()
 
-    # 1. Price Competitiveness
+    # 1. Price Competitiveness (dynamically proportional to w.PRICE weight)
     effective_budget = budget_cap
     if preferences and preferences.constraints and preferences.constraints.max_budget:
         effective_budget = min(budget_cap, preferences.constraints.max_budget)
 
     if offer.unit_price <= effective_budget:
         savings_pct = (effective_budget - offer.unit_price) / effective_budget
-        price_score = min(w.PRICE, max(10.0, 20.0 + (savings_pct * 50.0)))
+        price_score = min(w.PRICE, (w.PRICE * 0.60) + (savings_pct * w.PRICE * 1.60))
     else:
         overage_pct = (offer.unit_price - effective_budget) / effective_budget
-        price_score = max(0.0, 10.0 - (overage_pct * 40.0))
+        price_score = max(0.0, (w.PRICE * 0.35) - (overage_pct * w.PRICE * 2.0))
     price_score = round(price_score, 2)
 
     # 2. Delivery Time

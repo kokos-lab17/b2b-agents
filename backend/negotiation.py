@@ -55,6 +55,7 @@ class NegotiationEngine:
         payment_mode: PaymentMode | str | None = None,
         buyer_id: str = "default_buyer",
         preferences: BuyerPreferences | None = None,
+        specifications: str = "",
         session_id: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_vendors: Callable[[list[dict[str, Any]]], None] | None = None,
@@ -65,6 +66,7 @@ class NegotiationEngine:
         self.budget = budget
         self.buyer_id = buyer_id
         self.preferences = preferences
+        self.specifications = specifications
 
         # 1. Negotiation Mode Resolution (DEMO vs LIVE_AI)
         if negotiation_mode is not None:
@@ -113,11 +115,18 @@ class NegotiationEngine:
         self.events: list[dict[str, Any]] = []
         self.step_counter = 0
 
-        # Initialise public profiles and private constraints
+        # Initialise public profiles and private constraints (deterministic seeding in demo mode)
         self.sellers_info = dict(SELLER_PERSONAS)
         self.private_constraints: dict[str, PrivateSellerConstraint] = {}
-        for key in self.sellers_info:
-            self.private_constraints[key] = generate_private_constraints(key, budget, qty)
+
+        import hashlib
+        pref_key = self.preferences.priority_type.value if self.preferences else "DEFAULT"
+        seed_src = f"{self.product}:{self.qty}:{self.budget:.2f}:{self.specifications}:{pref_key}"
+        base_seed = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest()[:8], 16)
+
+        for idx, key in enumerate(self.sellers_info):
+            seller_seed = (base_seed + idx * 101) if self.demo_mode else None
+            self.private_constraints[key] = generate_private_constraints(key, budget, qty, seed=seller_seed)
             p = self.sellers_info[key]
             ensure_supplier_profile(p["name"], p["archetype"], p["style"], p["specialty"])
 
@@ -1020,9 +1029,9 @@ class NegotiationEngine:
 
         # Deterministic Seller Psychology (Feature 7 & Robust Fallback)
         if seller_key == "seller_a":
-            # Hard bargainer: firm, target price, basic warranty
-            price = round(max(c.min_unit_price + 3.0, c.target_unit_price), 2)
-            shipping = 150.0
+            # Hard bargainer: firm, target price, basic warranty, industrial freight
+            price = round(max(c.min_unit_price + 3.0, self.budget * 0.93), 2)
+            shipping = 120.0
             return CommercialOffer(
                 unit_price=price,
                 total_price=round(price * self.qty + shipping, 2),
@@ -1031,11 +1040,11 @@ class NegotiationEngine:
                 warranty_months=12,
                 shipping_cost=shipping,
                 payment_terms="Net 30",
-                special_concessions=["Standard Freight Rate"],
+                special_concessions=["Standard Industrial Freight"],
             )
         elif seller_key == "seller_b":
-            # Value defender: protects price, offers solid warranty
-            price = round(max(c.min_unit_price + 4.0, c.target_unit_price), 2)
+            # Value defender: protects price, offers solid initial warranty
+            price = round(max(c.min_unit_price + 4.0, self.budget * 0.96), 2)
             shipping = 80.0
             return CommercialOffer(
                 unit_price=price,
@@ -1048,9 +1057,9 @@ class NegotiationEngine:
                 special_concessions=["ISO 9001 QA Inspection"],
             )
         else:  # seller_c
-            # Strategic flexible: slightly lower price, fast delivery
-            price = round(max(c.min_unit_price + 2.0, c.target_unit_price), 2)
-            shipping = 100.0
+            # Strategic flexible: balanced opening price, fast dispatch
+            price = round(max(c.min_unit_price + 2.0, self.budget * 0.90), 2)
+            shipping = 60.0
             return CommercialOffer(
                 unit_price=price,
                 total_price=round(price * self.qty + shipping, 2),
@@ -1059,7 +1068,7 @@ class NegotiationEngine:
                 warranty_months=12,
                 shipping_cost=shipping,
                 payment_terms="Net 30",
-                special_concessions=["Priority Dispatch"],
+                special_concessions=["Priority Dispatch Queue"],
             )
 
     def _seller_round2_decision(
@@ -1116,27 +1125,42 @@ class NegotiationEngine:
             except Exception as exc:
                 logger.warning("Groq call failed for %s round 2, using deterministic policy: %s", seller_key, exc)
 
-        # Deterministic Policy (Feature 3 & 7): Distinct Psychological Bargaining
+        # Deterministic Policy (Feature 3 & 7): Distinct Psychological Bargaining & Requirement Awareness
         concession_text = buyer_proposal.concession_requested.lower() if buyer_proposal else ""
         rationale_text = buyer_proposal.rationale.lower() if buyer_proposal else ""
 
         if seller_key == "seller_a":
-            # The Hard Bargainer:
-            # Genuinely resists! If buyer does NOT offer a volume commitment or valuable concession,
-            # Seller A refuses to concede on price!
-            has_volume_commitment = "volume" in concession_text or "volume" in rationale_text or "repeat" in rationale_text
-            if has_volume_commitment:
-                # Softens moderately: provides $1.50 volume discount and lowers shipping to $100
-                new_price = round(max(c.min_unit_price, r1_offer.unit_price - 1.50), 2)
+            # The Hard Bargainer (Apex Industrial Corp):
+            # Volume & Commitment Driven!
+            # If buyer provides volume commitment (qty >= 200), lowest price priority, or requests volume discount:
+            is_volume_deal = (
+                self.qty >= 200
+                or (self.preferences and self.preferences.priority_type == BuyerPreferencePriority.LOWEST_PRICE)
+                or "volume" in concession_text
+                or "volume" in rationale_text
+                or "repeat" in rationale_text
+            )
+            if is_volume_deal:
+                if self.qty >= 500:
+                    discount_ratio = 0.72
+                elif self.qty >= 200 or (self.preferences and self.preferences.priority_type == BuyerPreferencePriority.LOWEST_PRICE):
+                    discount_ratio = 0.75
+                else:
+                    discount_ratio = 0.78
+                new_price = round(max(c.min_unit_price, self.budget * discount_ratio), 2)
+                price_cut = round(r1_offer.unit_price - new_price, 2)
                 return CommercialOffer(
                     unit_price=new_price,
-                    total_price=round(new_price * self.qty + 100.0, 2),
+                    total_price=round(new_price * self.qty + 90.0, 2),
                     quantity=self.qty,
-                    delivery_days=9,
+                    delivery_days=10,
                     warranty_months=12,
-                    shipping_cost=100.0,
+                    shipping_cost=90.0,
                     payment_terms="Net 30",
-                    special_concessions=["Volume Rebate of $1.50/unit"],
+                    special_concessions=[
+                        f"Scale Volume Rebate (${price_cut:.2f}/unit reduction)",
+                        "Discounted Industrial Freight ($90.00)",
+                    ],
                 )
             else:
                 # Firm refusal: Does NOT concede price without volume commitment!
@@ -1144,37 +1168,58 @@ class NegotiationEngine:
                     unit_price=r1_offer.unit_price,
                     total_price=r1_offer.total_price,
                     quantity=self.qty,
-                    delivery_days=r1_offer.delivery_days,
-                    warranty_months=r1_offer.warranty_months,
+                    delivery_days=10,
+                    warranty_months=12,
                     shipping_cost=r1_offer.shipping_cost,
                     payment_terms=r1_offer.payment_terms,
                     special_concessions=["Price Firm — Volume Commitment Required for Discounts"],
                 )
 
         elif seller_key == "seller_b":
-            # The Value Defender:
-            # Resists direct unit price cut, but upgrades warranty to 24 months and absorbs shipping to protect margin
-            return CommercialOffer(
-                unit_price=r1_offer.unit_price,
-                total_price=round(r1_offer.unit_price * self.qty, 2),
-                quantity=self.qty,
-                delivery_days=12,
-                warranty_months=24,
-                shipping_cost=0.0,  # Free shipping
-                payment_terms="Net 30",
-                special_concessions=["Extended 24-Month Warranty", "Free Freight Shipping"],
+            # The Value Defender (Sterling Quality Works):
+            # Value & Service Protection. Resists unit price erosion, but grants superior warranty & free shipping.
+            is_quality_priority = (
+                (self.preferences and self.preferences.priority_type == BuyerPreferencePriority.QUALITY_WARRANTY)
+                or (
+                    self.preferences
+                    and self.preferences.constraints
+                    and self.preferences.constraints.min_warranty_months
+                    and self.preferences.constraints.min_warranty_months >= 24
+                )
             )
-        else:  # seller_c
-            # The Strategic Flexible Negotiator:
-            # Flexes on delivery lead time, Net 60 terms, and free shipping
-            new_price = round(max(c.min_unit_price, r1_offer.unit_price - 1.00), 2)
+            warranty_months = 36 if is_quality_priority else 24
+            new_price = round(max(c.min_unit_price, self.budget * 0.90), 2)
+            concessions = [
+                f"Comprehensive {warranty_months}-Month Engineering Warranty",
+                "100% Free Freight Shipping",
+                "ISO 9001 Batch QA Certificate",
+            ]
             return CommercialOffer(
                 unit_price=new_price,
                 total_price=round(new_price * self.qty, 2),
                 quantity=self.qty,
-                delivery_days=5,
+                delivery_days=12,
+                warranty_months=warranty_months,
+                shipping_cost=0.0,  # 100% Free Freight
+                payment_terms="Net 30",
+                special_concessions=concessions,
+            )
+
+        else:  # seller_c
+            # The Strategic Flexible Negotiator (Vanguard Logistics & Supply):
+            # Capacity and Flexibility Driven. Fastest turnaround (4 days), Net 60 terms, free standard logistics.
+            new_price = round(max(c.min_unit_price, self.budget * 0.84), 2)
+            return CommercialOffer(
+                unit_price=new_price,
+                total_price=round(new_price * self.qty, 2),
+                quantity=self.qty,
+                delivery_days=4,
                 warranty_months=12,
                 shipping_cost=0.0,  # Free shipping
                 payment_terms="Net 60",
-                special_concessions=["Expedited 5-Day Delivery", "Net 60 Terms", "Free Shipping"],
+                special_concessions=[
+                    "Expedited 4-Day JIT Delivery",
+                    "Extended Net 60 Commercial Terms",
+                    "Free Standard Logistics",
+                ],
             )
