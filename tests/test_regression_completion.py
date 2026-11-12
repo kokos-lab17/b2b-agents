@@ -645,6 +645,54 @@ class TestRegressionProcurementCompletion(unittest.TestCase):
         res_fast = engine_fast.run()
         self.assertEqual(res_fast["winning_vendor"], "Vanguard Logistics & Supply")
 
+    def test_27_procurement_history_endpoints_and_reconstruction(self):
+        """27. Verify /api/sessions and /api/sessions/{session_id} full history reconstruction."""
+        # 1. Start procurement session with specifications
+        start_payload = {
+            "product": "Precision CNC Milling Cutters",
+            "qty": 75,
+            "budget": 85.0,
+            "demo_mode": True,
+            "specifications": "Tungsten carbide coating, tolerance +/- 0.005mm",
+        }
+        res_start = self.client.post("/api/start", json=start_payload)
+        self.assertEqual(res_start.status_code, 200)
+        session_id = res_start.json()["session_id"]
+
+        # 2. Wait for completion
+        for _ in range(30):
+            res_status = self.client.get(f"/api/status?session_id={session_id}")
+            if res_status.json().get("status") in ("awaiting_approval", "completed", "deal_selected"):
+                break
+            time.sleep(0.1)
+
+        # 3. Test GET /api/sessions
+        res_list = self.client.get("/api/sessions")
+        self.assertEqual(res_list.status_code, 200)
+        sessions = res_list.json().get("sessions", [])
+        self.assertTrue(len(sessions) > 0)
+        found = any(s.get("id") == session_id for s in sessions)
+        self.assertTrue(found, f"Session {session_id} should appear in /api/sessions")
+
+        # 4. Test GET /api/sessions/{session_id}
+        res_details = self.client.get(f"/api/sessions/{session_id}")
+        self.assertEqual(res_details.status_code, 200)
+        details = res_details.json()
+        self.assertEqual(details["session_id"], session_id)
+        self.assertEqual(details["product"], "Precision CNC Milling Cutters")
+        self.assertEqual(details["qty"], 75)
+        self.assertEqual(details["specifications"], "Tungsten carbide coating, tolerance +/- 0.005mm")
+        self.assertIsNotNone(details["selected_supplier"])
+        self.assertIsNotNone(details["deal"])
+        self.assertEqual(len(details["final_offers"]), 3)
+        self.assertEqual(len(details["opening_offers"]), 3)
+        self.assertTrue(len(details["events"]) > 0)
+        self.assertTrue(len(details["audit_trail"]) > 0)
+
+        # 5. Non-existent session returns 404
+        res_404 = self.client.get("/api/sessions/non-existent-session-id-1234")
+        self.assertEqual(res_404.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

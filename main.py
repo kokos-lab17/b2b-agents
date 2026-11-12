@@ -24,8 +24,10 @@ from backend.buyer_preferences import (
 )
 from backend.config import settings
 from backend.memory import (
+    get_full_session_details,
     get_latest_session,
     get_overall_procurement_analytics,
+    get_recent_sessions,
     get_session,
     get_session_audit_trail,
     get_session_events,
@@ -93,6 +95,7 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
                 "vendors": list(s.get("vendors", [])),
                 "deal": dict(s["deal"]) if s.get("deal") else None,
                 "final_offers": list(s.get("final_offers", [])),
+                "opening_offers": list(s.get("opening_offers", [])),
                 "winning_vendor": s.get("winning_vendor"),
                 "winning_offer": dict(s["winning_offer"]) if s.get("winning_offer") else None,
                 "buyer_intelligence": dict(s["buyer_intelligence"]) if s.get("buyer_intelligence") else None,
@@ -120,6 +123,12 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
                 final_offers_data = json.loads(db_s["final_offers_json"])
             except Exception:
                 pass
+        opening_offers_data = []
+        if db_s.get("opening_offers_json"):
+            try:
+                opening_offers_data = json.loads(db_s["opening_offers_json"])
+            except Exception:
+                pass
         intel_data = None
         if db_s.get("buyer_intelligence_json"):
             try:
@@ -136,6 +145,7 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
             "vendors": [],
             "deal": deal_data,
             "final_offers": final_offers_data,
+            "opening_offers": opening_offers_data,
             "winning_vendor": db_s.get("selected_supplier"),
             "winning_offer": deal_data,
             "buyer_intelligence": intel_data,
@@ -156,6 +166,7 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
         "vendors": [],
         "deal": None,
         "final_offers": [],
+        "opening_offers": [],
         "winning_vendor": None,
         "winning_offer": None,
         "buyer_intelligence": None,
@@ -235,6 +246,7 @@ def _run_procurement_worker(
                 s["status"] = result.get("status", "awaiting_approval")
                 s["deal"] = result.get("deal")
                 s["final_offers"] = result.get("final_offers", [])
+                s["opening_offers"] = result.get("opening_offers", [])
                 s["winning_vendor"] = result.get("winning_vendor")
                 s["winning_offer"] = result.get("winning_offer")
                 s["buyer_intelligence"] = result.get("buyer_intelligence")
@@ -256,6 +268,7 @@ def _run_procurement_worker(
             approve_url=result.get("approve_url"),
             selected_supplier=result.get("winning_vendor"),
             total_cost=winning_deal.get("total_cost") if winning_deal else None,
+            opening_offers=result.get("opening_offers", []),
         )
 
         logger.info(
@@ -643,9 +656,28 @@ async def get_audit_trail(session_id: str = Query(..., description="Procurement 
 
 
 # ---------------------------------------------------------------------------
+# Procurement History & Session Replay Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/sessions")
+async def list_recent_sessions(limit: int = Query(25, ge=1, le=100)):
+    """Retrieve historical procurement sessions from persistent SQLite store."""
+    sessions = get_recent_sessions(limit=limit)
+    return {"sessions": sessions}
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_details(session_id: str):
+    """Retrieve complete reconstructed history of a procurement session."""
+    details = get_full_session_details(session_id)
+    if not details:
+        raise HTTPException(status_code=404, detail=f"Procurement session '{session_id}' not found.")
+    return details
+
+
+# ---------------------------------------------------------------------------
 # Health Check Endpoint
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health():
     """Health check endpoint for deployment monitoring."""
-    return {"status": "healthy", "service": "b2b-agents-backend", "version": "2.0.0"}
+    return {"status": "healthy", "service": "quoto-ai-backend", "version": "2.1.0"}

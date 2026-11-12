@@ -66,7 +66,9 @@ def init_db(db_path: str | None = None) -> None:
                 _add_column_if_missing(conn, "procurement_sessions", "priority_type TEXT DEFAULT 'BALANCED_VALUE'")
                 _add_column_if_missing(conn, "procurement_sessions", "deal_json TEXT")
                 _add_column_if_missing(conn, "procurement_sessions", "final_offers_json TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "opening_offers_json TEXT")
                 _add_column_if_missing(conn, "procurement_sessions", "buyer_intelligence_json TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "specifications TEXT DEFAULT ''")
                 _add_column_if_missing(conn, "procurement_sessions", "order_id TEXT")
                 _add_column_if_missing(conn, "procurement_sessions", "approve_url TEXT")
 
@@ -252,6 +254,7 @@ def record_session(
     payment_mode: str = "SIMULATED",
     buyer_id: str = "default_buyer",
     priority_type: str = "BALANCED_VALUE",
+    specifications: str = "",
     db_path: str | None = None,
 ) -> None:
     """Create or update procurement session record."""
@@ -264,20 +267,21 @@ def record_session(
                     INSERT INTO procurement_sessions (
                         id, product, qty, budget, status, is_demo,
                         negotiation_mode, payment_mode, buyer_id, priority_type,
-                        created_at, updated_at
+                        specifications, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         status=excluded.status,
                         negotiation_mode=excluded.negotiation_mode,
                         payment_mode=excluded.payment_mode,
                         buyer_id=excluded.buyer_id,
                         priority_type=excluded.priority_type,
+                        specifications=COALESCE(NULLIF(excluded.specifications, ''), procurement_sessions.specifications),
                         updated_at=excluded.updated_at;
                 """, (
                     session_id, product, qty, budget, status, 1 if is_demo else 0,
                     negotiation_mode, payment_mode, buyer_id, priority_type,
-                    now, now
+                    specifications, now, now
                 ))
         finally:
             conn.close()
@@ -293,6 +297,7 @@ def record_session_result(
     approve_url: str | None = None,
     selected_supplier: str | None = None,
     total_cost: float | None = None,
+    opening_offers: list[dict[str, Any]] | None = None,
     db_path: str | None = None,
 ) -> None:
     """Persist completed or awaiting_approval session results so sessions can be recovered from DB."""
@@ -303,12 +308,14 @@ def record_session_result(
                 now = datetime.now(timezone.utc).isoformat()
                 deal_json = json.dumps(deal) if deal else None
                 offers_json = json.dumps(final_offers) if final_offers else None
+                opening_json = json.dumps(opening_offers) if opening_offers else None
                 intel_json = json.dumps(buyer_intelligence) if buyer_intelligence else None
                 cur = conn.execute("""
                     UPDATE procurement_sessions
                     SET status = ?,
                         deal_json = COALESCE(?, deal_json),
                         final_offers_json = COALESCE(?, final_offers_json),
+                        opening_offers_json = COALESCE(?, opening_offers_json),
                         buyer_intelligence_json = COALESCE(?, buyer_intelligence_json),
                         order_id = COALESCE(?, order_id),
                         approve_url = COALESCE(?, approve_url),
@@ -317,7 +324,7 @@ def record_session_result(
                         updated_at = ?
                     WHERE id = ?;
                 """, (
-                    status, deal_json, offers_json, intel_json,
+                    status, deal_json, offers_json, opening_json, intel_json,
                     order_id, approve_url, selected_supplier, total_cost,
                     now, session_id
                 ))
@@ -325,17 +332,17 @@ def record_session_result(
                     conn.execute("""
                         INSERT INTO procurement_sessions (
                             id, product, qty, budget, status, selected_supplier, total_cost,
-                            deal_json, final_offers_json, buyer_intelligence_json, order_id, approve_url,
+                            deal_json, final_offers_json, opening_offers_json, buyer_intelligence_json, order_id, approve_url,
                             created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """, (
                         session_id,
                         deal.get("product", "Procured Item") if deal else "Procured Item",
                         deal.get("quantity", 100) if deal else 100,
                         deal.get("unit_price", 0.0) if deal else 0.0,
                         status, selected_supplier, total_cost,
-                        deal_json, offers_json, intel_json, order_id, approve_url,
+                        deal_json, offers_json, opening_json, intel_json, order_id, approve_url,
                         now, now
                     ))
         finally:
@@ -459,6 +466,92 @@ def get_transaction(
                 return dict(row) if row else None
         finally:
             conn.close()
+
+
+def get_transaction_by_session(
+    session_id: str, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """Retrieve transaction details by session_id."""
+    with _db_lock:
+        conn = _get_connection(db_path)
+        try:
+            with conn:
+                cur = conn.execute(
+                    "SELECT session_id, order_id, supplier_name, amount, status, payment_mode, created_at, captured_at FROM transactions WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def get_full_session_details(
+    session_id: str, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """Reconstruct a complete procurement session history from SQLite."""
+    sess = get_session(session_id, db_path=db_path)
+    if not sess:
+        return None
+
+    deal = None
+    if sess.get("deal_json"):
+        try:
+            deal = json.loads(sess["deal_json"])
+        except Exception:
+            deal = None
+
+    final_offers = []
+    if sess.get("final_offers_json"):
+        try:
+            final_offers = json.loads(sess["final_offers_json"])
+        except Exception:
+            final_offers = []
+
+    opening_offers = []
+    if sess.get("opening_offers_json"):
+        try:
+            opening_offers = json.loads(sess["opening_offers_json"])
+        except Exception:
+            opening_offers = []
+
+    buyer_intelligence = None
+    if sess.get("buyer_intelligence_json"):
+        try:
+            buyer_intelligence = json.loads(sess["buyer_intelligence_json"])
+        except Exception:
+            buyer_intelligence = None
+
+    events = get_session_events(session_id, db_path=db_path)
+    audit_trail = get_session_audit_trail(session_id, db_path=db_path)
+    transaction = get_transaction_by_session(session_id, db_path=db_path)
+
+    return {
+        "session_id": sess.get("id"),
+        "product": sess.get("product"),
+        "qty": sess.get("qty"),
+        "budget": sess.get("budget"),
+        "specifications": sess.get("specifications") or "",
+        "status": sess.get("status"),
+        "selected_supplier": sess.get("selected_supplier"),
+        "total_cost": sess.get("total_cost"),
+        "is_demo": bool(sess.get("is_demo")),
+        "negotiation_mode": sess.get("negotiation_mode"),
+        "payment_mode": sess.get("payment_mode"),
+        "buyer_id": sess.get("buyer_id"),
+        "priority_type": sess.get("priority_type"),
+        "order_id": sess.get("order_id"),
+        "approve_url": sess.get("approve_url"),
+        "created_at": sess.get("created_at"),
+        "updated_at": sess.get("updated_at"),
+        "deal": deal,
+        "final_offers": final_offers,
+        "opening_offers": opening_offers,
+        "buyer_intelligence": buyer_intelligence,
+        "transaction": transaction,
+        "events": events,
+        "audit_trail": audit_trail,
+    }
 
 
 def record_payment_captured(

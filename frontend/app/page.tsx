@@ -6,8 +6,12 @@ import { AgGridReact } from 'ag-grid-react';
 
 ModuleRegistry.registerModules([AllCommunityModule]);
 
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || 'https://b2b-agents-secondary-branch.onrender.com';
+const getBackendUrl = (): string => {
+  if (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
+    return 'http://localhost:8000';
+  }
+  return process.env.NEXT_PUBLIC_BACKEND_URL || 'https://b2b-agents-secondary-branch.onrender.com';
+};
 
 type CommercialTerms = {
   unit_price: number;
@@ -170,7 +174,7 @@ type AuditEntry = {
   details?: Record<string, any> | null;
 };
 
-type ActiveTab = 'procurement' | 'intelligence' | 'simulator' | 'quotes' | 'audit';
+type ActiveTab = 'procurement' | 'intelligence' | 'simulator' | 'quotes' | 'history';
 
 type Phase = 'idle' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'no_agreement';
 
@@ -328,7 +332,7 @@ function removeStoredOrderId(): void {
 }
 
 const BUTTON_LABELS: Record<Phase, string> = {
-  idle: 'Start Autonomous Procurement',
+  idle: 'Start Autonomous Procurement with Quoto',
   running: 'Negotiating with Suppliers…',
   awaiting_approval: 'Start New Procurement',
   completed: 'Start New Procurement',
@@ -434,6 +438,13 @@ export default function Home() {
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
 
+  // Procurement History State
+  const [sessionsList, setSessionsList] = useState<any[]>([]);
+  const [selectedHistorySession, setSelectedHistorySession] = useState<any | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [showHistoryAudit, setShowHistoryAudit] = useState(false);
+
   // Refs
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollInFlightRef = useRef(false);
@@ -473,7 +484,7 @@ export default function Home() {
 
   const fetchRecommendations = useCallback(async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/buyer/recommendations?buyer_id=default_buyer`, { cache: 'no-store' });
+      const res = await fetch(`${getBackendUrl()}/api/buyer/recommendations?buyer_id=default_buyer`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data)) setRecommendations(data);
@@ -483,7 +494,7 @@ export default function Home() {
 
   const fetchBuyerProfile = useCallback(async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/buyer/profile?buyer_id=default_buyer`, { cache: 'no-store' });
+      const res = await fetch(`${getBackendUrl()}/api/buyer/profile?buyer_id=default_buyer`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         const eff = data?.effective_preferences || data?.saved_preferences;
@@ -502,7 +513,7 @@ export default function Home() {
 
   const handleAcceptRecommendation = async (recId: string) => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/buyer/recommendations/${recId}/accept?buyer_id=default_buyer`, {
+      const res = await fetch(`${getBackendUrl()}/api/buyer/recommendations/${recId}/accept?buyer_id=default_buyer`, {
         method: 'POST',
       });
       if (res.ok) {
@@ -517,7 +528,7 @@ export default function Home() {
 
   const handleIgnoreRecommendation = async (recId: string) => {
     try {
-      await fetch(`${BACKEND_URL}/api/buyer/recommendations/${recId}/ignore?buyer_id=default_buyer`, {
+      await fetch(`${getBackendUrl()}/api/buyer/recommendations/${recId}/ignore?buyer_id=default_buyer`, {
         method: 'POST',
       });
       fetchRecommendations();
@@ -527,7 +538,7 @@ export default function Home() {
   const fetchAnalytics = useCallback(async () => {
     setAnalyticsLoading(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/api/analytics`, { cache: 'no-store' });
+      const res = await fetch(`${getBackendUrl()}/api/analytics`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         setAnalytics(data);
@@ -540,7 +551,7 @@ export default function Home() {
   const fetchAuditTrail = useCallback(async (sessId: string) => {
     setAuditLoading(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/api/audit-trail?session_id=${encodeURIComponent(sessId)}`, { cache: 'no-store' });
+      const res = await fetch(`${getBackendUrl()}/api/audit-trail?session_id=${encodeURIComponent(sessId)}`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.audit_trail)) {
@@ -551,6 +562,41 @@ export default function Home() {
       setAuditLoading(false);
     }
   }, []);
+
+  const loadSessionDetails = useCallback(async (sessId: string) => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`${getBackendUrl()}/api/sessions/${encodeURIComponent(sessId)}`, { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        setSelectedHistorySession(data);
+      }
+    } catch {} finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  const fetchHistorySessions = useCallback(async () => {
+    setHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const res = await fetch(`${getBackendUrl()}/api/sessions?limit=30`, { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        const list = Array.isArray(data.sessions) ? data.sessions : [];
+        setSessionsList(list);
+        if (list.length > 0 && !selectedHistorySession) {
+          loadSessionDetails(list[0].id);
+        }
+      } else {
+        setHistoryError('Failed to load historical procurement sessions.');
+      }
+    } catch (err: any) {
+      setHistoryError(err?.message || 'Error fetching procurement session history.');
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [selectedHistorySession, loadSessionDetails]);
 
   const runSimulation = async () => {
     setSimLoading(true);
@@ -563,7 +609,7 @@ export default function Home() {
         max_delivery_days: simMaxDelivery ? Number(simMaxDelivery) : null,
         min_warranty_months: simMinWarranty ? Number(simMinWarranty) : null,
       };
-      const res = await fetch(`${BACKEND_URL}/api/simulator`, {
+      const res = await fetch(`${getBackendUrl()}/api/simulator`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -592,7 +638,7 @@ export default function Home() {
           },
         },
       };
-      const res = await fetch(`${BACKEND_URL}/api/quotes/compare`, {
+      const res = await fetch(`${getBackendUrl()}/api/quotes/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -638,7 +684,18 @@ export default function Home() {
       }
 
       const backendPhase = mapBackendStatus(data.status);
-      if (backendPhase === 'awaiting_approval') {
+      const isCompleted = backendPhase === 'completed' || data.status === 'captured';
+      const isAwaiting = backendPhase === 'awaiting_approval' || (Boolean(data.deal) && Array.isArray(data.final_offers) && data.final_offers.length >= 3);
+
+      if (isCompleted) {
+        stopPolling();
+        confirmingRef.current = false;
+        setCaptured(true);
+        setPhase('completed');
+        return;
+      }
+
+      if (isAwaiting) {
         stopPolling();
         if (!confirmingRef.current) {
           setPhase('awaiting_approval');
@@ -651,10 +708,6 @@ export default function Home() {
       }
       if (backendPhase) {
         stopPolling();
-        if (backendPhase === 'completed') {
-          confirmingRef.current = false;
-          setCaptured(true);
-        }
         setPhase(backendPhase);
         return;
       }
@@ -672,12 +725,13 @@ export default function Home() {
     pollInFlightRef.current = true;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
+      const timeout = setTimeout(() => controller.abort(), 10000);
       try {
-        const sid = targetSid || activeSessionIdRef.current || currentSessionId;
+        const sid = targetSid || activeSessionIdRef.current;
+        const backendUrl = getBackendUrl();
         const url = sid
-          ? `${BACKEND_URL}/api/status?session_id=${encodeURIComponent(sid)}`
-          : `${BACKEND_URL}/api/status`;
+          ? `${backendUrl}/api/status?session_id=${encodeURIComponent(sid)}`
+          : `${backendUrl}/api/status`;
         const res = await fetch(url, {
           cache: 'no-store',
           signal: controller.signal,
@@ -694,7 +748,7 @@ export default function Home() {
     } finally {
       pollInFlightRef.current = false;
     }
-  }, [applyStatusResponse, currentSessionId]);
+  }, [applyStatusResponse]);
 
   const executePaymentCapture = useCallback(
     async (tokenToCapture: string) => {
@@ -709,9 +763,11 @@ export default function Home() {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 35000);
         try {
-          const sessParam = currentSessionId ? `&session_id=${encodeURIComponent(currentSessionId)}` : '';
+          const sid = activeSessionIdRef.current || currentSessionId;
+          const sessParam = sid ? `&session_id=${encodeURIComponent(sid)}` : '';
+          const backendUrl = getBackendUrl();
           const res = await fetch(
-            `${BACKEND_URL}/api/confirm-payment?token=${encodeURIComponent(tokenToCapture)}${sessParam}`,
+            `${backendUrl}/api/confirm-payment?token=${encodeURIComponent(tokenToCapture)}${sessParam}`,
             { signal: controller.signal }
           );
           const data = await res.json();
@@ -728,9 +784,9 @@ export default function Home() {
           }
           // Fetch status once to update table
           try {
-            const statusUrl = currentSessionId
-              ? `${BACKEND_URL}/api/status?session_id=${encodeURIComponent(currentSessionId)}`
-              : `${BACKEND_URL}/api/status`;
+            const statusUrl = sid
+              ? `${backendUrl}/api/status?session_id=${encodeURIComponent(sid)}`
+              : `${backendUrl}/api/status`;
             const statusRes = await fetch(statusUrl, { cache: 'no-store' });
             if (statusRes.ok) {
               const statusData = await statusRes.json();
@@ -758,7 +814,8 @@ export default function Home() {
 
   const restoreLatestSession = useCallback(async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/status`, { cache: 'no-store' });
+      const backendUrl = getBackendUrl();
+      const res = await fetch(`${backendUrl}/api/status`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         if (mountedRef.current && data && data.status !== 'idle' && (data.events?.length > 0 || data.deal)) {
@@ -772,10 +829,22 @@ export default function Home() {
     } catch {}
   }, [applyStatusResponse]);
 
+  const executePaymentCaptureRef = useRef(executePaymentCapture);
+  executePaymentCaptureRef.current = executePaymentCapture;
+
+  const restoreLatestSessionRef = useRef(restoreLatestSession);
+  restoreLatestSessionRef.current = restoreLatestSession;
+
+  const fetchRecommendationsRef = useRef(fetchRecommendations);
+  fetchRecommendationsRef.current = fetchRecommendations;
+
+  const fetchBuyerProfileRef = useRef(fetchBuyerProfile);
+  fetchBuyerProfileRef.current = fetchBuyerProfile;
+
   useEffect(() => {
     mountedRef.current = true;
-    fetchRecommendations();
-    fetchBuyerProfile();
+    fetchRecommendationsRef.current();
+    fetchBuyerProfileRef.current();
 
     // Detect PayPal return or cancellation
     if (typeof window !== 'undefined') {
@@ -792,9 +861,9 @@ export default function Home() {
         window.history.replaceState({}, document.title, window.location.pathname);
       } else if (tokenParam && !isCancelled) {
         setOrderId(tokenParam);
-        executePaymentCapture(tokenParam);
+        executePaymentCaptureRef.current(tokenParam);
       } else {
-        restoreLatestSession();
+        restoreLatestSessionRef.current();
       }
     }
 
@@ -805,16 +874,16 @@ export default function Home() {
         pollRef.current = null;
       }
     };
-  }, [executePaymentCapture, fetchRecommendations, fetchBuyerProfile, restoreLatestSession]);
+  }, []);
 
   // When switching tabs, auto-fetch tab data
   useEffect(() => {
     if (activeTab === 'intelligence') {
       fetchAnalytics();
-    } else if (activeTab === 'audit' && currentSessionId) {
-      fetchAuditTrail(currentSessionId);
+    } else if (activeTab === 'history') {
+      fetchHistorySessions();
     }
-  }, [activeTab, currentSessionId, fetchAnalytics, fetchAuditTrail]);
+  }, [activeTab, fetchAnalytics, fetchHistorySessions]);
 
   const startPolling = useCallback((sessionId?: string) => {
     stopPolling();
@@ -825,7 +894,7 @@ export default function Home() {
     pollStatus(sid || undefined);
     pollRef.current = setInterval(() => {
       pollStatus(activeSessionIdRef.current || undefined);
-    }, 2000);
+    }, 1000);
   }, [pollStatus, stopPolling]);
 
   const validateForm = (): string[] => {
@@ -879,7 +948,8 @@ export default function Home() {
           },
         };
 
-        const res = await fetch(`${BACKEND_URL}/api/start`, {
+        const backendUrl = getBackendUrl();
+        const res = await fetch(`${backendUrl}/api/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -939,11 +1009,19 @@ export default function Home() {
       {/* Main Header */}
       <header className="mb-6 flex flex-col justify-between gap-4 border-b border-gray-800 pb-5 sm:flex-row sm:items-center">
         <div>
-          <h1 className="text-3xl font-extrabold tracking-tight text-white">
-            Autonomous B2B Procurement Engine
-          </h1>
-          <p className="mt-1 text-sm text-gray-400">
-            Multi-agent autonomous commercial negotiation with deterministic scoring, preference learning, and verified settlement.
+          <div className="flex items-center gap-3">
+            <h1 className="text-3xl font-extrabold tracking-tight text-white">
+              Quoto <span className="text-blue-500">AI</span>
+            </h1>
+            <span className="rounded-full border border-blue-500/30 bg-blue-500/10 px-2.5 py-0.5 text-xs font-semibold text-blue-400">
+              Autonomous Procurement
+            </span>
+          </div>
+          <p className="mt-1 text-sm font-medium text-blue-400/90">
+            Smarter Negotiations. Better Deals.
+          </p>
+          <p className="mt-0.5 text-xs text-gray-400 max-w-3xl">
+            An autonomous multi-agent procurement platform where an AI buyer negotiates with independent supplier agents, evaluates commercial offers, selects the best overall deal and facilitates buyer-authorized PayPal Sandbox payments.
           </p>
         </div>
 
@@ -995,14 +1073,14 @@ export default function Home() {
           </button>
           <button
             type="button"
-            onClick={() => setActiveTab('audit')}
+            onClick={() => setActiveTab('history')}
             className={`rounded px-3 py-1.5 font-medium transition-colors ${
-              activeTab === 'audit'
+              activeTab === 'history'
                 ? 'bg-blue-600 text-white shadow-sm'
                 : 'text-gray-400 hover:text-gray-200'
             }`}
           >
-            Decision Governance & Audit Trail
+            Procurement History
           </button>
         </nav>
       </header>
@@ -2278,58 +2356,412 @@ export default function Home() {
         </section>
       )}
 
-      {/* TAB 5: DECISION AUDIT TRAIL */}
-      {activeTab === 'audit' && (
+      {/* TAB 5: PROCUREMENT HISTORY & REPLAY */}
+      {activeTab === 'history' && (
         <section className="space-y-6">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
             <div>
-              <h2 className="text-xl font-bold text-white">Decision Governance Audit Trail</h2>
+              <div className="flex items-center gap-2">
+                <span className="rounded bg-blue-500/20 px-2.5 py-0.5 text-xs font-bold uppercase tracking-wider text-blue-400">
+                  SQLite Ledger
+                </span>
+                <h2 className="text-xl font-bold text-white">Procurement History & Contract Governance</h2>
+              </div>
               <p className="mt-1 text-xs text-gray-400">
-                Explainable record of autonomous agent strategy formulation, adaptation, and commercial winner selection.
+                Full historical reconstruction of past autonomous procurement runs, opening quotes, negotiated concessions, commercial scores, and verified settlement records.
               </p>
             </div>
-            {currentSessionId && (
-              <button
-                onClick={() => fetchAuditTrail(currentSessionId)}
-                className="rounded bg-gray-800 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-700"
-              >
-                Refresh Log
-              </button>
-            )}
+            <button
+              onClick={fetchHistorySessions}
+              disabled={historyLoading}
+              className="rounded-lg bg-gray-800 px-4 py-2 text-xs font-semibold text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-50"
+            >
+              {historyLoading ? 'Refreshing…' : '↻ Refresh History'}
+            </button>
           </div>
 
-          {auditLoading && <p className="text-sm text-gray-400">Loading audit records...</p>}
-
-          {!currentSessionId && (
-            <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-6 text-center text-xs text-gray-400">
-              No active session selected. Start a procurement run to generate an explainable audit trail.
+          {historyError && (
+            <div className="rounded-lg border border-red-800/80 bg-red-950/40 p-3 text-xs text-red-300">
+              {historyError}
             </div>
           )}
 
-          {auditEntries.length > 0 && (
-            <div className="space-y-3">
-              {auditEntries.map((entry) => (
-                <div
-                  key={entry.id}
-                  className="rounded-lg border border-gray-800 bg-gray-900/60 p-4 text-xs shadow-sm"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="rounded bg-blue-500/10 px-2 py-0.5 font-bold uppercase tracking-wider text-blue-300">
-                        {entry.action}
-                      </span>
-                      <span className="font-semibold text-white">{entry.actor}</span>
-                    </div>
-                    <span className="font-mono text-gray-500">{entry.timestamp}</span>
+          {/* Historical Sessions Table */}
+          <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-lg">
+            <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+              Completed & In-Progress Procurement Sessions ({sessionsList.length})
+            </h3>
+            {sessionsList.length === 0 ? (
+              <div className="py-8 text-center text-xs text-gray-500">
+                No past procurement sessions found in SQLite database. Start a procurement run to record your first contract negotiation!
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-800 text-gray-400">
+                      <th className="pb-2">Session ID</th>
+                      <th className="pb-2">Date / Time</th>
+                      <th className="pb-2">Product</th>
+                      <th className="pb-2">Quantity</th>
+                      <th className="pb-2">Target Budget</th>
+                      <th className="pb-2">Selected Winner</th>
+                      <th className="pb-2">Agreed Total</th>
+                      <th className="pb-2">Status</th>
+                      <th className="pb-2 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-800/50">
+                    {sessionsList.map((s) => {
+                      const isSelected = selectedHistorySession?.session_id === s.id;
+                      const dateStr = s.created_at ? new Date(s.created_at).toLocaleString() : '—';
+                      return (
+                        <tr
+                          key={s.id}
+                          onClick={() => loadSessionDetails(s.id)}
+                          className={`cursor-pointer transition-colors ${
+                            isSelected
+                              ? 'bg-blue-950/40 border-l-2 border-l-blue-500'
+                              : 'hover:bg-gray-800/30'
+                          }`}
+                        >
+                          <td className="py-2.5 font-mono text-[11px] text-blue-400 font-semibold">{s.id}</td>
+                          <td className="py-2.5 text-gray-400 text-[11px]">{dateStr}</td>
+                          <td className="py-2.5 font-semibold text-white">{s.product}</td>
+                          <td className="py-2.5 text-gray-300">{s.qty}</td>
+                          <td className="py-2.5 text-gray-300">{formatCurrency(s.budget)}/unit</td>
+                          <td className="py-2.5 font-semibold text-cyan-300">{s.selected_supplier || 'In Progress'}</td>
+                          <td className="py-2.5 font-bold text-emerald-400">
+                            {s.total_cost ? formatCurrency(s.total_cost) : '—'}
+                          </td>
+                          <td className="py-2.5">
+                            <span
+                              className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
+                                s.status === 'completed' || s.transaction_status === 'captured'
+                                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                                  : s.status === 'awaiting_approval'
+                                  ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
+                                  : 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
+                              }`}
+                            >
+                              {s.transaction_status === 'captured' ? 'Captured' : s.status}
+                            </span>
+                          </td>
+                          <td className="py-2.5 text-right">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                loadSessionDetails(s.id);
+                              }}
+                              className={`rounded px-2 py-1 text-[11px] font-medium transition-colors ${
+                                isSelected
+                                  ? 'bg-blue-600 text-white'
+                                  : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                              }`}
+                            >
+                              {isSelected ? 'Viewing' : 'Inspect'}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Selected Session Reconstructed Details */}
+          {selectedHistorySession && (
+            <div className="space-y-6 rounded-xl border border-blue-500/30 bg-gray-900/40 p-6 shadow-2xl">
+              {/* Header Card */}
+              <div className="flex flex-col justify-between gap-4 border-b border-gray-800 pb-4 sm:flex-row sm:items-start">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded bg-blue-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-400">
+                      Reconstructed Session
+                    </span>
+                    <span className="font-mono text-xs text-gray-400">{selectedHistorySession.session_id}</span>
                   </div>
-                  <p className="mt-2 text-gray-300 leading-relaxed">{entry.reason}</p>
-                  {entry.details && (
-                    <pre className="mt-2 overflow-x-auto rounded bg-gray-950 p-2 font-mono text-[11px] text-gray-400">
-                      {JSON.stringify(entry.details, null, 2)}
-                    </pre>
+                  <h3 className="mt-1 text-2xl font-black text-white">
+                    {selectedHistorySession.product}
+                  </h3>
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-gray-300">
+                    <span>
+                      Quantity: <strong className="text-white">{selectedHistorySession.qty}</strong> units
+                    </span>
+                    <span>•</span>
+                    <span>
+                      Target Budget Cap: <strong className="text-white">{formatCurrency(selectedHistorySession.budget)}</strong>/unit
+                    </span>
+                    <span>•</span>
+                    <span>
+                      Priority Archetype: <strong className="text-cyan-300">{selectedHistorySession.priority_type || 'BALANCED_VALUE'}</strong>
+                    </span>
+                    <span>•</span>
+                    <span>
+                      Negotiation Mode: <strong className="text-purple-300">{selectedHistorySession.negotiation_mode}</strong>
+                    </span>
+                    <span>•</span>
+                    <span>
+                      Payment Mode: <strong className="text-emerald-300">{selectedHistorySession.payment_mode}</strong>
+                    </span>
+                  </div>
+                </div>
+
+                {selectedHistorySession.selected_supplier && (
+                  <div className="rounded-xl border border-cyan-500/40 bg-cyan-950/20 p-4 text-right">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-400">Commercial Winner</span>
+                    <p className="text-base font-extrabold text-white">{selectedHistorySession.selected_supplier}</p>
+                    <p className="mt-1 text-lg font-black text-emerald-400">
+                      {formatCurrency(selectedHistorySession.total_cost || selectedHistorySession.deal?.terms?.total_price)}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Specifications Card */}
+              {selectedHistorySession.specifications && (
+                <div className="rounded-lg border border-gray-800 bg-gray-950/60 p-4 text-xs">
+                  <span className="font-semibold uppercase tracking-wider text-gray-400 text-[10px]">
+                    Buyer Custom Specifications & Constraints
+                  </span>
+                  <p className="mt-1 text-gray-200 leading-relaxed font-mono">
+                    {selectedHistorySession.specifications}
+                  </p>
+                </div>
+              )}
+
+              {/* Side-by-Side 3-Supplier Comparison Table: Opening vs Final Offers */}
+              <div>
+                <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-300">
+                  Side-by-Side Multi-Supplier Comparison: Opening Quotes vs Final Agreed Terms
+                </h4>
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                  {(selectedHistorySession.final_offers?.length > 0
+                    ? selectedHistorySession.final_offers
+                    : selectedHistorySession.deal
+                    ? [
+                        {
+                          vendor: selectedHistorySession.deal.selected_vendor,
+                          unit_price: selectedHistorySession.deal.terms.unit_price,
+                          total_price: selectedHistorySession.deal.terms.total_price,
+                          delivery_days: selectedHistorySession.deal.terms.delivery_days,
+                          warranty_months: selectedHistorySession.deal.terms.warranty_months,
+                          shipping_cost: selectedHistorySession.deal.terms.shipping_cost,
+                          payment_terms: selectedHistorySession.deal.terms.payment_terms,
+                          special_concessions: selectedHistorySession.deal.terms.special_concessions || [],
+                          commercial_score: selectedHistorySession.deal.commercial_score,
+                          is_winner: true,
+                        },
+                      ]
+                    : []
+                  ).map((fo: any) => {
+                    const isWinner = fo.is_winner || fo.vendor === selectedHistorySession.selected_supplier;
+                    const opening = selectedHistorySession.opening_offers?.find((o: any) => o.vendor === fo.vendor);
+                    const openingPrice = opening ? opening.unit_price : fo.initial_unit_price;
+                    const priceDrop = openingPrice && openingPrice > fo.unit_price ? Number((openingPrice - fo.unit_price).toFixed(2)) : 0;
+                    const priceDropPct = openingPrice && openingPrice > 0 ? Number(((priceDrop / openingPrice) * 100).toFixed(1)) : 0;
+
+                    return (
+                      <div
+                        key={fo.vendor}
+                        className={`rounded-xl border p-4.5 shadow-md transition-all ${
+                          isWinner
+                            ? 'border-cyan-500/60 bg-cyan-950/25 ring-1 ring-cyan-500/30'
+                            : 'border-gray-800 bg-gray-950/70'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2 border-b border-gray-800/80 pb-3">
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-bold text-white text-sm">{fo.vendor}</span>
+                              {isWinner && (
+                                <span className="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                                  ★ Winner
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[11px] text-gray-400">
+                              {fo.archetype ||
+                                (fo.vendor.includes('Apex')
+                                  ? 'Hard Bargainer'
+                                  : fo.vendor.includes('Sterling')
+                                  ? 'Value Defender'
+                                  : 'Strategic Flexible Negotiator')}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-[10px] uppercase text-gray-500">Score</span>
+                            <p className={`text-lg font-black ${isWinner ? 'text-cyan-300' : 'text-gray-300'}`}>
+                              {fo.commercial_score !== undefined ? formatNumber(fo.commercial_score, 1) : '—'}
+                              <span className="text-xs font-normal text-gray-500">/100</span>
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Opening vs Final Comparison Box */}
+                        <div className="mt-3 space-y-2 text-xs">
+                          <div className="rounded bg-gray-900/90 p-2.5 border border-gray-800">
+                            <div className="flex items-center justify-between text-[11px] text-gray-400">
+                              <span>Opening Quote:</span>
+                              <span className="font-mono text-gray-300">
+                                {openingPrice ? formatCurrency(openingPrice) : '—'}/unit
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between">
+                              <span className="text-gray-300 font-semibold">Final Agreed Price:</span>
+                              <span className="font-bold text-emerald-400 text-sm">
+                                {formatCurrency(fo.unit_price)}/unit
+                              </span>
+                            </div>
+                            {priceDrop > 0 && (
+                              <div className="mt-1 text-[10px] font-semibold text-emerald-400/90 text-right">
+                                Concession: ↓ {formatCurrency(priceDrop)} (-{priceDropPct}%)
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 text-[11px]">
+                            <div className="rounded bg-gray-900/60 p-2 border border-gray-800">
+                              <span className="text-gray-400">Lead Time</span>
+                              <p className="mt-0.5 font-semibold text-white">{fo.delivery_days} Days</p>
+                            </div>
+                            <div className="rounded bg-gray-900/60 p-2 border border-gray-800">
+                              <span className="text-gray-400">Warranty</span>
+                              <p className="mt-0.5 font-semibold text-purple-300">{fo.warranty_months} Mos</p>
+                            </div>
+                            <div className="rounded bg-gray-900/60 p-2 border border-gray-800">
+                              <span className="text-gray-400">Freight</span>
+                              <p className="mt-0.5 font-semibold text-white">
+                                {fo.shipping_cost <= 0 ? 'FREE ($0)' : formatCurrency(fo.shipping_cost)}
+                              </p>
+                            </div>
+                            <div className="rounded bg-gray-900/60 p-2 border border-gray-800">
+                              <span className="text-gray-400">Terms</span>
+                              <p className="mt-0.5 font-semibold text-blue-300">{fo.payment_terms}</p>
+                            </div>
+                          </div>
+
+                          {fo.special_concessions && fo.special_concessions.length > 0 && (
+                            <div className="pt-1">
+                              <span className="text-[10px] text-gray-400 font-medium">Concessions Won:</span>
+                              <div className="mt-1 flex flex-wrap gap-1">
+                                {fo.special_concessions.map((c: string, idx: number) => (
+                                  <span
+                                    key={idx}
+                                    className="rounded bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 text-[10px] text-purple-300 font-medium"
+                                  >
+                                    ✓ {c}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Buyer Intelligence & Commercial Selection Card */}
+              {selectedHistorySession.buyer_intelligence && (
+                <div className="rounded-xl border border-gray-800 bg-gray-950/70 p-5 text-xs shadow-md">
+                  <span className="font-semibold uppercase tracking-wider text-blue-400 text-[10px]">
+                    Commercial Deal Governance & Selection Rationale
+                  </span>
+                  <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div className="rounded-lg bg-gray-900/80 p-3 border border-gray-800">
+                      <span className="text-gray-400 text-[11px]">Budget Headroom</span>
+                      <p className="mt-0.5 font-bold text-emerald-400 text-sm">
+                        {formatCurrency(selectedHistorySession.buyer_intelligence.budget_headroom)}
+                      </p>
+                      <span className="text-[10px] text-gray-500">
+                        {selectedHistorySession.buyer_intelligence.budget_utilization_pct}% budget used
+                      </span>
+                    </div>
+                    <div className="rounded-lg bg-gray-900/80 p-3 border border-gray-800">
+                      <span className="text-gray-400 text-[11px]">Negotiated Price Savings</span>
+                      <p className="mt-0.5 font-bold text-emerald-400 text-sm">
+                        {formatCurrency(selectedHistorySession.buyer_intelligence.negotiated_savings)}
+                      </p>
+                      <span className="text-[10px] text-gray-500">extracted via buyer proposals</span>
+                    </div>
+                    <div className="rounded-lg bg-gray-900/80 p-3 border border-gray-800">
+                      <span className="text-gray-400 text-[11px]">Order Settlement Mode</span>
+                      <p className="mt-0.5 font-bold text-cyan-300 text-sm">
+                        {selectedHistorySession.payment_mode}
+                      </p>
+                      <span className="text-[10px] text-gray-500">
+                        {selectedHistorySession.transaction?.status === 'captured' ? 'Captured' : selectedHistorySession.status}
+                      </span>
+                    </div>
+                    <div className="rounded-lg bg-gray-900/80 p-3 border border-gray-800">
+                      <span className="text-gray-400 text-[11px]">Order Reference ID</span>
+                      <p className="mt-0.5 font-mono font-bold text-white text-xs truncate">
+                        {selectedHistorySession.order_id || selectedHistorySession.transaction?.order_id || '—'}
+                      </p>
+                      <span className="text-[10px] text-gray-500">immutable transaction ID</span>
+                    </div>
+                  </div>
+
+                  {selectedHistorySession.buyer_intelligence.recommended_reason && (
+                    <div className="mt-4 rounded-lg bg-blue-950/20 border border-blue-900/30 p-3 text-gray-300 leading-relaxed italic text-xs">
+                      “{selectedHistorySession.buyer_intelligence.recommended_reason}”
+                    </div>
                   )}
                 </div>
-              ))}
+              )}
+
+              {/* Technical Governance Audit Trail Toggle */}
+              {selectedHistorySession.audit_trail && selectedHistorySession.audit_trail.length > 0 && (
+                <div className="rounded-xl border border-gray-800 bg-gray-950/60 p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h5 className="font-semibold text-white text-xs uppercase tracking-wider">
+                        Technical Decision Governance Trail ({selectedHistorySession.audit_trail.length} records)
+                      </h5>
+                      <p className="text-[11px] text-gray-400 mt-0.5">
+                        Audit logs of autonomous strategy selection, state adaptations, and supplier evaluations.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setShowHistoryAudit(!showHistoryAudit)}
+                      className="rounded bg-gray-800 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-gray-700"
+                    >
+                      {showHistoryAudit ? 'Hide Audit Log' : 'Show Full Audit Log'}
+                    </button>
+                  </div>
+
+                  {showHistoryAudit && (
+                    <div className="mt-4 space-y-2.5">
+                      {selectedHistorySession.audit_trail.map((entry: any) => (
+                        <div
+                          key={entry.id}
+                          className="rounded-lg border border-gray-800/80 bg-gray-900/70 p-3 text-xs shadow-sm"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="rounded bg-blue-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-300">
+                                {entry.action}
+                              </span>
+                              <span className="font-semibold text-white">{entry.actor}</span>
+                            </div>
+                            <span className="font-mono text-gray-500 text-[11px]">{entry.timestamp}</span>
+                          </div>
+                          <p className="mt-1.5 text-gray-300 leading-relaxed">{entry.reason}</p>
+                          {entry.details && (
+                            <pre className="mt-2 overflow-x-auto rounded bg-gray-950 p-2 font-mono text-[10px] text-gray-400">
+                              {JSON.stringify(entry.details, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </section>

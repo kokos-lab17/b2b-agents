@@ -197,6 +197,7 @@ class NegotiationEngine:
             payment_mode=self.payment_mode.value,
             buyer_id=self.buyer_id,
             priority_type=(self.preferences.priority_type.value if self.preferences else None),
+            specifications=self.specifications,
         )
 
         logger.info(
@@ -444,6 +445,24 @@ class NegotiationEngine:
         )
 
         # Build 3-Supplier Comparison Summary
+        opening_offers_summary: list[dict[str, Any]] = []
+        for key, r1 in round1_offers.items():
+            p = self.sellers_info[key]
+            opening_offers_summary.append({
+                "vendor": p["name"],
+                "archetype": p["archetype"],
+                "style": p["style"],
+                "specialty": p["specialty"],
+                "key": key,
+                "unit_price": r1.unit_price,
+                "total_price": r1.total_price,
+                "quantity": r1.quantity,
+                "delivery_days": r1.delivery_days,
+                "warranty_months": r1.warranty_months,
+                "shipping_cost": r1.shipping_cost,
+                "payment_terms": r1.payment_terms,
+            })
+
         final_offers_summary: list[dict[str, Any]] = []
         for key, offer in final_offers.items():
             p = self.sellers_info[key]
@@ -605,6 +624,7 @@ class NegotiationEngine:
                 payment_mode=self.payment_mode.value,
                 buyer_id=self.buyer_id,
                 priority_type=(self.preferences.priority_type.value if self.preferences else None),
+                specifications=self.specifications,
             )
             return {
                 "session_id": self.session_id,
@@ -621,6 +641,7 @@ class NegotiationEngine:
                     "terms": winning_offer.model_dump(),
                 },
                 "final_offers": final_offers_summary,
+                "opening_offers": opening_offers_summary,
                 "winning_vendor": winning_name,
                 "winning_offer": winning_offer.model_dump(),
                 "buyer_intelligence": buyer_intelligence,
@@ -689,6 +710,7 @@ class NegotiationEngine:
                 payment_mode=self.payment_mode.value,
                 buyer_id=self.buyer_id,
                 priority_type=(self.preferences.priority_type.value if self.preferences else None),
+                specifications=self.specifications,
             )
             return {
                 "session_id": self.session_id,
@@ -705,6 +727,7 @@ class NegotiationEngine:
                     "terms": winning_offer.model_dump(),
                 },
                 "final_offers": final_offers_summary,
+                "opening_offers": opening_offers_summary,
                 "winning_vendor": winning_name,
                 "winning_offer": winning_offer.model_dump(),
                 "buyer_intelligence": buyer_intelligence,
@@ -734,6 +757,7 @@ class NegotiationEngine:
                 payment_mode=self.payment_mode.value,
                 buyer_id=self.buyer_id,
                 priority_type=(self.preferences.priority_type.value if self.preferences else None),
+                specifications=self.specifications,
             )
             return {
                 "session_id": self.session_id,

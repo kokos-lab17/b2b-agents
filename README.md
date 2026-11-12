@@ -1,5 +1,7 @@
-# Autonomous Multi-Agent B2B Procurement System
+# Quoto AI — Smarter Negotiations. Better Deals.
 
+> **An autonomous multi-agent procurement platform where an AI buyer negotiates with independent supplier agents, evaluates commercial offers, selects the best overall deal and facilitates buyer-authorized PayPal Sandbox payments.**  
+>  
 > **PayPal AI Hackathon Submission**  
 > **Live Frontend Preview:** [https://b2b-agents-secondary-frontend.onrender.com](https://b2b-agents-secondary-frontend.onrender.com)  
 > **Live Backend API:** [https://b2b-agents-secondary-branch.onrender.com](https://b2b-agents-secondary-branch.onrender.com)  
@@ -14,7 +16,7 @@ Traditional enterprise procurement suffers from severe friction:
 2. **One-Dimensional Price Bargaining**: Most buyers fixate solely on unit price, ignoring crucial commercial levers such as delivery lead times, warranty duration, freight absorption, and payment terms (e.g., Net 60 cash-flow optimization).
 3. **Fragile Automation & Bot Vulnerabilities**: Simple bots either fold instantly to seller opening quotes or enter endless confrontation without adapting strategy. Furthermore, automated checkout flows often lack fail-closed security and human authorization gates.
 
-The **Autonomous Multi-Agent B2B Procurement System** solves this by deploying an autonomous AI Buyer Director that negotiates multi-variable commercial contracts simultaneously across three independent seller agents, dynamically pivots strategies when price walls are encountered, evaluates trade-offs through deterministic scoring and mandatory constraints, and seamlessly settles agreements through human-authorized PayPal Sandbox checkout.
+**Quoto AI** solves this by deploying an autonomous AI Buyer Director that negotiates multi-variable commercial contracts simultaneously across three independent seller agents, dynamically pivots strategies when price walls are encountered, evaluates trade-offs through deterministic scoring and mandatory constraints, and seamlessly settles agreements through human-authorized PayPal Sandbox checkout.
 
 ---
 

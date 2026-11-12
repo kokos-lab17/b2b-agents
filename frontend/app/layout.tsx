@@ -4,8 +4,8 @@ import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-alpine.css';
 
 export const metadata: Metadata = {
-  title: 'Autonomous B2B Multi-Agent Procurement & Negotiation',
-  description: 'Autonomous AI agents negotiate multi-variable commercial contracts and settle via PayPal Sandbox.',
+  title: 'Quoto AI — Smarter Negotiations. Better Deals.',
+  description: 'An autonomous multi-agent procurement platform where an AI buyer negotiates with independent supplier agents, evaluates commercial offers, selects the best overall deal and facilitates buyer-authorized PayPal Sandbox payments.',
 };
 
 export default function RootLayout({
