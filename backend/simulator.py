@@ -97,10 +97,13 @@ def run_what_if_simulation(req: WhatIfSimulationRequest) -> WhatIfSimulationResu
 
     # Pick recommended winner prioritizing qualified candidates
     qualified_sims = [s for s in supplier_simulations if not s["is_disqualified"]]
-    candidates = qualified_sims if qualified_sims else supplier_simulations
-    candidates.sort(key=lambda x: x["commercial_score"], reverse=True)
-    recommended_winner = candidates[0]["supplier_name"]
-    winning_total_cost = candidates[0]["estimated_total_cost"]
+    if qualified_sims:
+        qualified_sims.sort(key=lambda x: x["commercial_score"], reverse=True)
+        recommended_winner = qualified_sims[0]["supplier_name"]
+        winning_total_cost = qualified_sims[0]["estimated_total_cost"]
+    else:
+        recommended_winner = "None (All Disqualified)"
+        winning_total_cost = 0.0
 
     return WhatIfSimulationResult(
         product=req.product,

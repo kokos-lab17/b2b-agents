@@ -407,43 +407,6 @@ class NegotiationEngine:
             )
         logger.info("[%s] Stage 7: Commercial scoring completed across all 5 dimensions.", self.session_id)
 
-        # Honor hard constraints: prioritize qualified candidates
-        qualified_candidates = [c for c in scored_candidates if not c["is_disqualified"]]
-        candidates_to_rank = qualified_candidates if qualified_candidates else scored_candidates
-        candidates_to_rank.sort(key=lambda x: x["total_score"], reverse=True)
-
-        winner = candidates_to_rank[0]
-        winning_name = winner["name"]
-        winning_offer: CommercialOffer = winner["offer"]
-        winning_breakdown: CommercialScoreBreakdown = winner["score_breakdown"]
-        logger.info(
-            "[%s] Stage 8: Winning supplier selected: '%s' with commercial score %.1f/100.",
-            self.session_id,
-            winning_name,
-            winning_breakdown.total_score,
-        )
-
-        # Record strategy outcome for procurement intelligence (1 per session, based on winning deal & concessions)
-        winner_key = winner["key"]
-        winner_r1_price = round1_offers[winner_key].unit_price
-        winner_final_price = winner["offer"].unit_price
-        any_concession = any(
-            round1_offers[c["key"]].unit_price > c["offer"].unit_price or
-            round1_offers[c["key"]].shipping_cost > c["offer"].shipping_cost or
-            round1_offers[c["key"]].delivery_days > c["offer"].delivery_days or
-            round1_offers[c["key"]].warranty_months < c["offer"].warranty_months
-            for c in scored_candidates
-        )
-        record_strategy_outcome(
-            session_id=self.session_id,
-            strategy=current_strategy,
-            supplier_name=winning_name,
-            initial_price=winner_r1_price,
-            final_price=winner_final_price,
-            concession_obtained=any_concession,
-            won=True,
-        )
-
         # Build 3-Supplier Comparison Summary
         opening_offers_summary: list[dict[str, Any]] = []
         for key, r1 in round1_offers.items():
@@ -487,13 +450,115 @@ class NegotiationEngine:
                 "special_concessions": list(offer.special_concessions or []),
                 "commercial_score": cand["total_score"] if cand else 0.0,
                 "score_breakdown": cand["score_breakdown"].model_dump() if cand else {},
-                "is_winner": (key == winner["key"]),
+                "is_winner": False,
                 "is_disqualified": cand["is_disqualified"] if cand else False,
                 "violations": cand["violations"] if cand else [],
                 "initial_unit_price": r1_unit,
                 "price_reduction": price_cut,
                 "price_reduction_pct": price_cut_pct,
             })
+
+        # Honor hard constraints: strictly reject disqualified candidates
+        qualified_candidates = [c for c in scored_candidates if not c["is_disqualified"]]
+        if not qualified_candidates:
+            all_violations = {c["name"]: c["violations"] for c in scored_candidates}
+            logger.warning("[%s] Stage 8: All suppliers violated mandatory constraints: %s", self.session_id, all_violations)
+            record_audit_event(
+                session_id=self.session_id,
+                action="MANDATORY_CONSTRAINTS_FAILED",
+                agent="Buyer Agent",
+                reasoning="All supplier offers violated mandatory commercial constraints. Disqualifying all suppliers and halting deal execution.",
+                details={"violations_by_supplier": all_violations},
+            )
+            self._emit(
+                agent="Buyer Agent",
+                message=(
+                    "PROCUREMENT HALTED: All supplier counteroffers violated your mandatory constraints. "
+                    "No compliant supplier could be selected."
+                ),
+                status="no_agreement",
+                event_type="no_agreement",
+                details={"violations_by_supplier": all_violations},
+            )
+            record_session(
+                session_id=self.session_id,
+                product=self.product,
+                qty=self.qty,
+                budget=self.budget,
+                status="no_agreement",
+                is_demo=self.demo_mode,
+                negotiation_mode=self.negotiation_mode.value,
+                payment_mode=self.payment_mode.value,
+                buyer_id=self.buyer_id,
+                priority_type=(self.preferences.priority_type.value if self.preferences else None),
+                specifications=self.specifications,
+            )
+            return {
+                "session_id": self.session_id,
+                "status": "no_agreement",
+                "order_id": None,
+                "approve_url": None,
+                "payment_mode": self.payment_mode.value,
+                "negotiation_mode": self.negotiation_mode.value,
+                "vendors": public_vendors,
+                "deal": None,
+                "final_offers": final_offers_summary,
+                "opening_offers": opening_offers_summary,
+                "winning_vendor": None,
+                "winning_offer": None,
+                "buyer_intelligence": {
+                    "recommended_supplier": "None (All Disqualified)",
+                    "recommended_reason": "All suppliers violated mandatory buyer constraints.",
+                    "trade_offs": "No supplier met the minimum mandatory criteria.",
+                },
+                "events": self.events,
+                "token_usage": (
+                    self.groq_client.get_usage_metadata(is_demo=self.demo_mode).model_dump()
+                    if self.groq_client
+                    else {"total_tokens": 0, "total_calls": 0, "is_demo": True}
+                ),
+            }
+
+        candidates_to_rank = list(qualified_candidates)
+        candidates_to_rank.sort(key=lambda x: x["total_score"], reverse=True)
+
+        winner = candidates_to_rank[0]
+        winning_name = winner["name"]
+        winning_offer: CommercialOffer = winner["offer"]
+        winning_breakdown: CommercialScoreBreakdown = winner["score_breakdown"]
+
+        # Mark winner in final_offers_summary
+        for fo in final_offers_summary:
+            if fo["vendor"] == winning_name:
+                fo["is_winner"] = True
+
+        logger.info(
+            "[%s] Stage 8: Winning supplier selected: '%s' with commercial score %.1f/100.",
+            self.session_id,
+            winning_name,
+            winning_breakdown.total_score,
+        )
+
+        # Record strategy outcome for procurement intelligence (1 per session, based on winning deal & concessions)
+        winner_key = winner["key"]
+        winner_r1_price = round1_offers[winner_key].unit_price
+        winner_final_price = winner["offer"].unit_price
+        any_concession = any(
+            round1_offers[c["key"]].unit_price > c["offer"].unit_price or
+            round1_offers[c["key"]].shipping_cost > c["offer"].shipping_cost or
+            round1_offers[c["key"]].delivery_days > c["offer"].delivery_days or
+            round1_offers[c["key"]].warranty_months < c["offer"].warranty_months
+            for c in scored_candidates
+        )
+        record_strategy_outcome(
+            session_id=self.session_id,
+            strategy=current_strategy,
+            supplier_name=winning_name,
+            initial_price=winner_r1_price,
+            final_price=winner_final_price,
+            concession_obtained=any_concession,
+            won=True,
+        )
 
         # Build Buyer Intelligence Summary
         budget_total = round(self.budget * self.qty, 2)
@@ -790,6 +855,7 @@ class NegotiationEngine:
     # -------------------------------------------------------------------------
     def _buyer_evaluate_and_decide(self, r1_offers: dict[str, CommercialOffer]) -> dict[str, Any]:
         """Buyer Agent evaluates actual Round 1 responses and decides next strategy."""
+        is_fallback = False
         # 1. Live Groq LLM Evaluation
         if not self.demo_mode and self.groq_client:
             try:
@@ -820,8 +886,24 @@ class NegotiationEngine:
                     }
                     for key, o in r1_offers.items()
                 }
+                specs_text = f"\nProcurement Specifications: {self.specifications}" if self.specifications else ""
+                prefs_text = f"\nBuyer Priority: {self.preferences.priority_type.value}" if self.preferences else ""
+                constraints_text = ""
+                if self.preferences and self.preferences.constraints:
+                    c_pref = self.preferences.constraints
+                    active_c = []
+                    if c_pref.max_delivery_days:
+                        active_c.append(f"Max delivery: {c_pref.max_delivery_days} days")
+                    if c_pref.min_warranty_months:
+                        active_c.append(f"Min warranty: {c_pref.min_warranty_months} months")
+                    if c_pref.max_shipping_cost is not None:
+                        active_c.append(f"Max shipping: ${c_pref.max_shipping_cost:.2f}")
+                    if active_c:
+                        constraints_text = f"\nMandatory Constraints: {', '.join(active_c)}"
+
                 user_msg = (
-                    f"Product: {self.product}, Qty: {self.qty}, Budget: ${self.budget:.2f}/unit.\n"
+                    f"Product: {self.product}, Qty: {self.qty}, Budget: ${self.budget:.2f}/unit."
+                    f"{specs_text}{prefs_text}{constraints_text}\n"
                     f"Actual Seller Round 1 Offers: {json.dumps(r1_summary)}\n"
                     "Evaluate these offers. Choose the most effective strategy and formulate concrete proposals for each seller."
                 )
@@ -850,6 +932,7 @@ class NegotiationEngine:
                     }
             except Exception as exc:
                 logger.warning("Groq call failed for Buyer Agent, falling back to state-dependent policy: %s", exc)
+                is_fallback = True
 
         # 2. State-Dependent Decision Policy (Used in Demo Mode or Fallback)
         # Evaluates actual numerical positions of the sellers and buyer preferences:
@@ -1001,6 +1084,9 @@ class NegotiationEngine:
                 ),
             }
 
+        if is_fallback:
+            reasoning = f"[Deterministic Fallback - Groq Call Failed] {reasoning}"
+
         return {
             "chosen_strategy": chosen_strategy,
             "strategy_reasoning": reasoning,
@@ -1023,8 +1109,9 @@ class NegotiationEngine:
                     f"Output schema: {{\"unit_price\": float, \"delivery_days\": int, "
                     f"\"warranty_months\": int, \"shipping_cost\": float, \"payment_terms\": str, \"reasoning\": str}}"
                 )
+                specs_text = f", Specifications: {self.specifications}" if self.specifications else ""
                 user_msg = (
-                    f"Product: {self.product}, Qty: {self.qty}, Buyer target offer: ${buyer_target:.2f}/unit. "
+                    f"Product: {self.product}, Qty: {self.qty}{specs_text}, Buyer target offer: ${buyer_target:.2f}/unit. "
                     "Make your opening commercial counter-offer."
                 )
                 data = self.groq_client.call_agent(
@@ -1115,7 +1202,9 @@ class NegotiationEngine:
                     "Evaluate the buyer's concrete proposal. Make concessions ONLY where it aligns with your psychology.\n"
                     "Output schema: {{\"unit_price\": float, \"delivery_days\": int, \"warranty_months\": int, \"shipping_cost\": float, \"payment_terms\": str, \"special_concessions\": [str]}}"
                 )
+                specs_text = f"Product: {self.product}, Qty: {self.qty}, Specifications: {self.specifications}\n" if self.specifications else f"Product: {self.product}, Qty: {self.qty}\n"
                 user_msg = (
+                    f"{specs_text}"
                     f"Your Round 1 Offer was: ${r1_offer.unit_price:.2f}/unit, {r1_offer.delivery_days} days, {r1_offer.warranty_months} mos warranty, ${r1_offer.shipping_cost:.2f} shipping, terms: {r1_offer.payment_terms}.\n"
                     f"Buyer Proposal for you: target_price=${buyer_proposal.target_unit_price:.2f}, target_delivery={buyer_proposal.target_delivery_days} days, "
                     f"target_warranty={buyer_proposal.target_warranty_months} mos, target_shipping=${buyer_proposal.target_shipping_cost:.2f}, terms={buyer_proposal.target_payment_terms}.\n"
