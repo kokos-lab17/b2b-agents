@@ -162,9 +162,10 @@ class PayPalClient:
             logger.error("Failed to create PayPal Sandbox order: %s", exc)
             raise PayPalError(f"PayPal order creation failed: {exc}") from exc
 
-    def get_order_details(self, order_id: str) -> dict[str, Any]:
+    def get_order_details(self, order_id: str, token: str | None = None) -> dict[str, Any]:
         """Fetch full PayPal order details to verify status, currency, amount, and payer."""
-        token = self._get_access_token()
+        if not token:
+            token = self._get_access_token()
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 resp = client.get(
@@ -193,24 +194,40 @@ class PayPalClient:
                     },
                 )
                 if resp.status_code == 422:
+                    is_already_captured = False
                     try:
                         err_data = resp.json()
                         details = err_data.get("details", [])
                         if any(d.get("issue") == "ORDER_ALREADY_CAPTURED" for d in details) or "ORDER_ALREADY_CAPTURED" in resp.text:
-                            # Verify actual status from PayPal directly rather than blindly assuming
-                            try:
-                                order_info = self.get_order_details(order_id)
-                                if order_info.get("status") == "COMPLETED":
-                                    logger.info(
-                                        "Order %s verified as COMPLETED via PayPal; treating as captured idempotently.",
-                                        order_id,
-                                    )
-                                    return {"id": order_id, "status": "COMPLETED", "already_captured": True}
-                            except Exception as check_exc:
-                                logger.warning("Could not verify order %s status: %s", order_id, check_exc)
-                                return {"id": order_id, "status": "COMPLETED", "already_captured": True}
+                            is_already_captured = True
                     except Exception:
-                        pass
+                        if "ORDER_ALREADY_CAPTURED" in resp.text:
+                            is_already_captured = True
+
+                    if is_already_captured:
+                        # Verify actual status from PayPal directly rather than blindly assuming (Requirement 11.4)
+                        try:
+                            order_info = self.get_order_details(order_id, token=token)
+                            if order_info.get("status") == "COMPLETED":
+                                logger.info(
+                                    "Order %s verified as COMPLETED via PayPal; treating as captured idempotently.",
+                                    order_id,
+                                )
+                                return {"id": order_id, "status": "COMPLETED", "already_captured": True}
+                            else:
+                                actual_status = order_info.get("status")
+                                raise PayPalError(
+                                    f"Cannot confirm capture for order {order_id}: PayPal reported ORDER_ALREADY_CAPTURED but actual order status is '{actual_status}', not 'COMPLETED'."
+                                )
+                        except PayPalError:
+                            raise
+                        except Exception as check_exc:
+                            logger.error("Failed to verify order %s status with PayPal: %s", order_id, check_exc)
+                            raise PayPalError(
+                                f"Failed to independently verify already-captured status for PayPal order {order_id}: {check_exc}"
+                            ) from check_exc
+                    else:
+                        raise PayPalError(f"PayPal order capture rejected with 422: {resp.text}")
 
                 resp.raise_for_status()
                 data = resp.json()

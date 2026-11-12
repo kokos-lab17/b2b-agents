@@ -8,10 +8,14 @@ from typing import Any, Callable
 from backend.config import settings
 from backend.groq_client import BudgetExhaustedError, GroqClient
 from backend.models import (
+    BuyerPreferences,
+    BuyerPreferencePriority,
     BuyerProposal,
     CommercialOffer,
     CommercialScoreBreakdown,
     Event,
+    NegotiationMode,
+    PaymentMode,
     PrivateSellerConstraint,
     SupplierProfile,
     validate_and_sanitize_offer,
@@ -19,11 +23,14 @@ from backend.models import (
 from backend.memory import (
     ensure_supplier_profile,
     get_supplier_metrics,
+    record_audit_event,
     record_deal_accepted,
     record_negotiation_attempt,
     record_session,
+    record_session_event,
+    record_strategy_outcome,
 )
-from backend.paypal import PayPalClient
+from backend.paypal import PayPalClient, PayPalError
 from backend.personas import (
     BUYER_PERSONA,
     SELLER_PERSONAS,
@@ -44,19 +51,64 @@ class NegotiationEngine:
         qty: int,
         budget: float,
         demo_mode: bool = False,
+        negotiation_mode: NegotiationMode | str | None = None,
+        payment_mode: PaymentMode | str | None = None,
+        buyer_id: str = "default_buyer",
+        preferences: BuyerPreferences | None = None,
+        session_id: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_vendors: Callable[[list[dict[str, Any]]], None] | None = None,
     ):
-        self.session_id = f"proc-{uuid.uuid4().hex[:12]}"
+        self.session_id = session_id or f"proc-{uuid.uuid4().hex[:12]}"
         self.product = product
         self.qty = qty
         self.budget = budget
-        self.demo_mode = demo_mode or not bool(settings.GROQ_API_KEY)
+        self.buyer_id = buyer_id
+        self.preferences = preferences
+
+        # 1. Negotiation Mode Resolution (DEMO vs LIVE_AI)
+        if negotiation_mode is not None:
+            self.negotiation_mode = (
+                negotiation_mode
+                if isinstance(negotiation_mode, NegotiationMode)
+                else NegotiationMode(str(negotiation_mode).upper())
+            )
+        elif demo_mode:
+            self.negotiation_mode = NegotiationMode.DEMO
+        else:
+            self.negotiation_mode = (
+                NegotiationMode.DEMO if not bool(settings.GROQ_API_KEY) else NegotiationMode.LIVE_AI
+            )
+
+        self.demo_mode = (self.negotiation_mode == NegotiationMode.DEMO)
+
+        # 2. Payment Mode Resolution (SIMULATED vs PAYPAL_SANDBOX)
+        if payment_mode is not None:
+            self.payment_mode = (
+                payment_mode
+                if isinstance(payment_mode, PaymentMode)
+                else PaymentMode(str(payment_mode).upper())
+            )
+        elif demo_mode:
+            self.payment_mode = PaymentMode.SIMULATED
+        else:
+            self.payment_mode = PaymentMode.PAYPAL_SANDBOX
+
+        # 3. Groq Client Enforcement
+        if self.negotiation_mode == NegotiationMode.LIVE_AI:
+            if not bool(settings.GROQ_API_KEY):
+                raise ValueError(
+                    "Groq API key is not configured for Live AI mode. "
+                    "Please set GROQ_API_KEY or select Demo mode."
+                )
+            self.groq_client = GroqClient()
+        else:
+            # Deterministic Demo Mode: Zero Groq calls guaranteed
+            self.groq_client = None
+
+        self.paypal_client = PayPalClient()
         self.on_event = on_event
         self.on_vendors = on_vendors
-
-        self.groq_client = GroqClient() if not self.demo_mode else None
-        self.paypal_client = PayPalClient()
 
         self.events: list[dict[str, Any]] = []
         self.step_counter = 0
@@ -102,12 +154,29 @@ class NegotiationEngine:
             evt["approve_url"] = approve_url
 
         self.events.append(evt)
+
+        # Record event in SQLite database for persistent session isolation
+        try:
+            record_session_event(
+                session_id=self.session_id,
+                agent=agent,
+                event_type=event_type,
+                message=formatted_message,
+                status=status,
+                strategy=strategy,
+                offer=offer,
+                details=details,
+                approve_url=approve_url,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record session event: %s", exc)
+
         if self.on_event:
             self.on_event(evt)
         return evt
 
     def run(self) -> dict[str, Any]:
-        """Execute full autonomous procurement pipeline."""
+        """Execute full autonomous procurement pipeline with session isolation and preference awareness."""
         record_session(
             session_id=self.session_id,
             product=self.product,
@@ -115,6 +184,10 @@ class NegotiationEngine:
             budget=self.budget,
             status="negotiating",
             is_demo=self.demo_mode,
+            negotiation_mode=self.negotiation_mode.value,
+            payment_mode=self.payment_mode.value,
+            buyer_id=self.buyer_id,
+            priority_type=(self.preferences.priority_type.value if self.preferences else None),
         )
 
         # 1. Announce Vendors & History
@@ -136,17 +209,50 @@ class NegotiationEngine:
         if self.on_vendors:
             self.on_vendors(public_vendors)
 
-        mode_desc = "Deterministic Demo Simulation" if self.demo_mode else "Live Autonomous AI (Groq)"
+        mode_desc = f"{self.negotiation_mode.value} negotiation, {self.payment_mode.value} settlement"
+        pref_desc = f" (Priority: {self.preferences.priority_type.value})" if self.preferences else ""
         self._emit(
             agent="System",
-            message=f"Starting procurement session for {self.qty} units of '{self.product}' (Budget cap: ${self.budget:.2f}/unit) using {mode_desc}.",
+            message=f"Starting procurement session for {self.qty} units of '{self.product}' (Budget cap: ${self.budget:.2f}/unit) [{mode_desc}]{pref_desc}.",
             status="negotiating",
             event_type="procurement_start",
         )
 
-        # 2. Buyer Strategy Formulation: Initial strategy based on product & budget
-        initial_strategy = "PRICE_DISCOUNT"
-        target_discount_unit = round(self.budget * 0.80, 2)
+        # 2. Buyer Strategy Formulation: Align with buyer preference priorities
+        if self.preferences:
+            p_type = self.preferences.priority_type
+            if p_type == BuyerPreferencePriority.FASTEST_DELIVERY:
+                initial_strategy = "EXPEDITED_DELIVERY_AND_TERMS"
+                target_discount_unit = round(self.budget * 0.90, 2)
+            elif p_type == BuyerPreferencePriority.QUALITY_WARRANTY:
+                initial_strategy = "WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION"
+                target_discount_unit = round(self.budget * 0.90, 2)
+            elif p_type == BuyerPreferencePriority.LOWEST_PRICE:
+                initial_strategy = "PRICE_DISCOUNT"
+                target_discount_unit = round(self.budget * 0.78, 2)
+            else:
+                initial_strategy = "PRICE_DISCOUNT"
+                target_discount_unit = round(self.budget * 0.85, 2)
+        else:
+            initial_strategy = "PRICE_DISCOUNT"
+            target_discount_unit = round(self.budget * 0.80, 2)
+
+        record_audit_event(
+            session_id=self.session_id,
+            action="STRATEGY_FORMULATION",
+            agent="Buyer Agent",
+            reasoning=(
+                f"Initial strategy set to '{initial_strategy}' reflecting "
+                f"buyer priority '{self.preferences.priority_type.value if self.preferences else 'DEFAULT'}'. "
+                f"Target price: ${target_discount_unit:.2f}/unit."
+            ),
+            details={
+                "strategy": initial_strategy,
+                "target_price": target_discount_unit,
+                "preferences": self.preferences.model_dump() if self.preferences else None,
+            },
+        )
+
         self._emit(
             agent="Buyer Agent",
             message=(
@@ -189,12 +295,21 @@ class NegotiationEngine:
                 final_total_price=validated_offer.total_price,
             )
 
-        # 4. Genuinely Autonomous Buyer Evaluation & Concrete Proposals (Feature 1 & 2)
-        # Buyer dynamically evaluates the actual seller responses and decides whether to continue
-        # with price or adaptively switch strategies based on seller pushback.
+        # 4. Genuinely Autonomous Buyer Evaluation & Concrete Proposals
         buyer_decision = self._buyer_evaluate_and_decide(round1_offers)
         current_strategy = buyer_decision["chosen_strategy"]
         proposals_by_seller = buyer_decision["proposals"]
+
+        record_audit_event(
+            session_id=self.session_id,
+            action="STRATEGY_ADAPTATION",
+            agent="Buyer Agent",
+            reasoning=buyer_decision["strategy_reasoning"],
+            details={
+                "chosen_strategy": current_strategy,
+                "proposals": {k: v.model_dump() for k, v in proposals_by_seller.items()},
+            },
+        )
 
         self._emit(
             agent="Buyer Agent",
@@ -210,7 +325,6 @@ class NegotiationEngine:
             r1 = round1_offers[key]
             prop = proposals_by_seller.get(key)
             offer_r2 = self._seller_round2_decision(key, r1, prop, current_strategy)
-            # Python validation enforcement across all 5 dimensions
             validated_r2 = validate_and_sanitize_offer(offer_r2, self.private_constraints[key], self.qty)
             final_offers[key] = validated_r2
 
@@ -239,7 +353,7 @@ class NegotiationEngine:
                 final_total_price=validated_r2.total_price,
             )
 
-        # 6. Deterministic Multi-Factor Commercial Scoring (Feature 4)
+        # 6. Deterministic Multi-Factor Commercial Scoring with Constraints
         scored_candidates: list[dict[str, Any]] = []
         for key, offer in final_offers.items():
             p = self.sellers_info[key]
@@ -248,6 +362,7 @@ class NegotiationEngine:
                 offer=offer,
                 budget_cap=self.budget,
                 reliability_score=metrics["reliability_score"],
+                preferences=self.preferences,
             )
             scored_candidates.append(
                 {
@@ -256,15 +371,48 @@ class NegotiationEngine:
                     "offer": offer,
                     "score_breakdown": breakdown,
                     "total_score": breakdown.total_score,
+                    "is_disqualified": breakdown.is_disqualified,
+                    "violations": breakdown.constraint_violations,
                 }
             )
 
-        # Sort by total commercial score descending (highest score wins, not blindly lowest price)
-        scored_candidates.sort(key=lambda x: x["total_score"], reverse=True)
-        winner = scored_candidates[0]
+        # Honor hard constraints: prioritize qualified candidates
+        qualified_candidates = [c for c in scored_candidates if not c["is_disqualified"]]
+        candidates_to_rank = qualified_candidates if qualified_candidates else scored_candidates
+        candidates_to_rank.sort(key=lambda x: x["total_score"], reverse=True)
+
+        winner = candidates_to_rank[0]
         winning_name = winner["name"]
         winning_offer: CommercialOffer = winner["offer"]
         winning_breakdown: CommercialScoreBreakdown = winner["score_breakdown"]
+
+        # Record strategy outcomes for procurement intelligence
+        for c in scored_candidates:
+            is_winner = (c["key"] == winner["key"])
+            record_strategy_outcome(
+                session_id=self.session_id,
+                strategy=current_strategy,
+                supplier_name=c["name"],
+                initial_price=round1_offers[c["key"]].unit_price,
+                final_price=c["offer"].unit_price,
+                won=is_winner,
+            )
+
+        record_audit_event(
+            session_id=self.session_id,
+            action="VENDOR_SELECTION",
+            agent="Buyer Agent",
+            reasoning=(
+                f"Selected {winning_name} with commercial score {winning_breakdown.total_score}/100. "
+                f"Commercial Rationale: {winning_breakdown.explanation}"
+            ),
+            details={
+                "winner": winning_name,
+                "score": winning_breakdown.total_score,
+                "breakdown": winning_breakdown.model_dump(),
+                "disqualified_count": len([c for c in scored_candidates if c["is_disqualified"]]),
+            },
+        )
 
         self._emit(
             agent="Buyer Agent",
@@ -284,26 +432,28 @@ class NegotiationEngine:
             },
         )
 
-        # 7. Order Execution & Settlement (Feature 6 & 7)
-        if self.demo_mode:
-            # Deterministic Demo Mode: Register active demo transaction awaiting confirmation
-            order_id = f"DEMO-{uuid.uuid4().hex[:12].upper()}"
+        # 7. Order Execution & Settlement (Payment Mode Separation)
+        if self.payment_mode == PaymentMode.SIMULATED:
+            # Deterministic Simulated Payment: Zero PayPal external calls, no fake PayPal URLs
+            order_id = f"DEMO-{uuid.uuid4().hex[:12].upper()}" if self.demo_mode else f"SIM-{uuid.uuid4().hex[:12].upper()}"
             record_deal_accepted(
                 session_id=self.session_id,
                 order_id=order_id,
                 supplier_name=winning_name,
                 amount=winning_offer.total_price,
+                payment_mode="SIMULATED",
             )
             self._emit(
                 agent="System",
                 message=(
-                    f"SIMULATED DEAL APPROVED: Order {order_id} awaiting approval. "
-                    f"Deal locked at ${winning_offer.unit_price:.2f}/unit (${winning_offer.total_price:.2f} total). "
-                    "Demo mode demonstrates autonomous multi-agent strategy switching without real PayPal transactions."
+                    f"SIMULATED DEAL APPROVED: Order {order_id} awaiting settlement confirmation. "
+                    f"Deal locked at ${winning_offer.unit_price:.2f}/unit (${winning_offer.total_price:.2f} total) with {winning_name}. "
+                    "Payment mode: SIMULATED (no external payment provider calls)."
                 ),
                 status="awaiting_approval",
                 event_type="order_created",
                 offer=winning_offer.unit_price,
+                details={"order_id": order_id, "payment_mode": "SIMULATED"},
             )
             record_session(
                 session_id=self.session_id,
@@ -311,13 +461,19 @@ class NegotiationEngine:
                 qty=self.qty,
                 budget=self.budget,
                 status="awaiting_approval",
-                is_demo=True,
+                is_demo=self.demo_mode,
+                negotiation_mode=self.negotiation_mode.value,
+                payment_mode=self.payment_mode.value,
+                buyer_id=self.buyer_id,
+                priority_type=(self.preferences.priority_type.value if self.preferences else None),
             )
             return {
                 "session_id": self.session_id,
                 "status": "awaiting_approval",
                 "order_id": order_id,
-                "approve_url": "https://www.sandbox.paypal.com/demo-approval",
+                "approve_url": None,
+                "payment_mode": "SIMULATED",
+                "negotiation_mode": self.negotiation_mode.value,
                 "vendors": public_vendors,
                 "deal": {
                     "selected_vendor": winning_name,
@@ -327,13 +483,13 @@ class NegotiationEngine:
                 },
                 "events": self.events,
                 "token_usage": (
-                    self.groq_client.get_usage_metadata(is_demo=True).model_dump()
+                    self.groq_client.get_usage_metadata(is_demo=self.demo_mode).model_dump()
                     if self.groq_client
                     else {"total_tokens": 0, "total_calls": 0, "is_demo": True}
                 ),
             }
 
-        # Live AI Mode: Real PayPal Sandbox order creation
+        # Live PayPal Sandbox Mode: Real PayPal Sandbox order creation
         try:
             order_id, approve_url = self.paypal_client.create_order(
                 product=self.product,
@@ -345,17 +501,19 @@ class NegotiationEngine:
                 order_id=order_id,
                 supplier_name=winning_name,
                 amount=winning_offer.total_price,
+                payment_mode="PAYPAL_SANDBOX",
             )
             self._emit(
                 agent="System",
                 message=(
                     f"PayPal Sandbox Order {order_id} created successfully. "
-                    "Awaiting human buyer approval on PayPal Sandbox."
+                    "Awaiting human buyer authorization on PayPal Sandbox."
                 ),
                 status="awaiting_approval",
                 event_type="order_created",
                 approve_url=approve_url,
                 offer=winning_offer.unit_price,
+                details={"order_id": order_id, "payment_mode": "PAYPAL_SANDBOX", "approve_url": approve_url},
             )
             record_session(
                 session_id=self.session_id,
@@ -363,13 +521,19 @@ class NegotiationEngine:
                 qty=self.qty,
                 budget=self.budget,
                 status="awaiting_approval",
-                is_demo=False,
+                is_demo=self.demo_mode,
+                negotiation_mode=self.negotiation_mode.value,
+                payment_mode=self.payment_mode.value,
+                buyer_id=self.buyer_id,
+                priority_type=(self.preferences.priority_type.value if self.preferences else None),
             )
             return {
                 "session_id": self.session_id,
                 "status": "awaiting_approval",
                 "order_id": order_id,
                 "approve_url": approve_url,
+                "payment_mode": "PAYPAL_SANDBOX",
+                "negotiation_mode": self.negotiation_mode.value,
                 "vendors": public_vendors,
                 "deal": {
                     "selected_vendor": winning_name,
@@ -378,25 +542,47 @@ class NegotiationEngine:
                     "terms": winning_offer.model_dump(),
                 },
                 "events": self.events,
-                "token_usage": self.groq_client.get_usage_metadata(is_demo=False).model_dump(),
+                "token_usage": (
+                    self.groq_client.get_usage_metadata(is_demo=False).model_dump()
+                    if self.groq_client
+                    else {"total_tokens": 0, "total_calls": 0, "is_demo": True}
+                ),
             }
         except Exception as exc:
             logger.error("Failed to create PayPal order: %s", exc)
             self._emit(
                 agent="System",
-                message=f"Order creation failed: {exc}",
+                message=f"PayPal order creation failed: {exc}",
                 status="failed",
                 event_type="failed",
+            )
+            record_session(
+                session_id=self.session_id,
+                product=self.product,
+                qty=self.qty,
+                budget=self.budget,
+                status="failed",
+                is_demo=self.demo_mode,
+                negotiation_mode=self.negotiation_mode.value,
+                payment_mode=self.payment_mode.value,
+                buyer_id=self.buyer_id,
+                priority_type=(self.preferences.priority_type.value if self.preferences else None),
             )
             return {
                 "session_id": self.session_id,
                 "status": "failed",
                 "order_id": None,
                 "approve_url": None,
+                "payment_mode": "PAYPAL_SANDBOX",
+                "negotiation_mode": self.negotiation_mode.value,
                 "vendors": public_vendors,
                 "events": self.events,
                 "deal": None,
-                "token_usage": self.groq_client.get_usage_metadata(is_demo=False).model_dump(),
+                "token_usage": (
+                    self.groq_client.get_usage_metadata(is_demo=False).model_dump()
+                    if self.groq_client
+                    else {"total_tokens": 0, "total_calls": 0, "is_demo": True}
+                ),
             }
 
     # -------------------------------------------------------------------------
@@ -466,13 +652,81 @@ class NegotiationEngine:
                 logger.warning("Groq call failed for Buyer Agent, falling back to state-dependent policy: %s", exc)
 
         # 2. State-Dependent Decision Policy (Used in Demo Mode or Fallback)
-        # Evaluates actual numerical positions of the sellers:
+        # Evaluates actual numerical positions of the sellers and buyer preferences:
         min_offered_price = min(o.unit_price for o in r1_offers.values())
         discount_percentage = (self.budget - min_offered_price) / self.budget
 
-        # If sellers offered >= 12% discount below budget in Round 1:
-        # Sellers demonstrated price flexibility! Buyer pushes further on price.
-        if discount_percentage >= 0.12:
+        if self.preferences and self.preferences.priority_type == BuyerPreferencePriority.FASTEST_DELIVERY:
+            chosen_strategy = "EXPEDITED_DELIVERY_AND_TERMS"
+            reasoning = (
+                "Buyer priority is FASTEST_DELIVERY. Pivoting strategy to 'EXPEDITED_DELIVERY_AND_TERMS' "
+                "to secure accelerated dispatch lead times and priority logistics concessions."
+            )
+            proposals = {
+                "seller_a": BuyerProposal(
+                    target_unit_price=r1_offers["seller_a"].unit_price,
+                    target_delivery_days=7,
+                    target_warranty_months=12,
+                    target_shipping_cost=r1_offers["seller_a"].shipping_cost,
+                    target_payment_terms="Net 30",
+                    rationale="Agreeing to unit price if dispatch lead time is reduced to 7 business days.",
+                    concession_requested="Accelerated 7-day dispatch",
+                ),
+                "seller_b": BuyerProposal(
+                    target_unit_price=r1_offers["seller_b"].unit_price,
+                    target_delivery_days=9,
+                    target_warranty_months=18,
+                    target_shipping_cost=r1_offers["seller_b"].shipping_cost,
+                    target_payment_terms="Net 30",
+                    rationale="Holding unit price in exchange for expedited quality-certified delivery.",
+                    concession_requested="Priority delivery queue",
+                ),
+                "seller_c": BuyerProposal(
+                    target_unit_price=r1_offers["seller_c"].unit_price,
+                    target_delivery_days=4,
+                    target_warranty_months=12,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 60",
+                    rationale="Leveraging logistics specialty for ultra-fast 4-day delivery.",
+                    concession_requested="Express 4-day delivery and free shipping",
+                ),
+            }
+        elif self.preferences and self.preferences.priority_type == BuyerPreferencePriority.QUALITY_WARRANTY:
+            chosen_strategy = "WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION"
+            reasoning = (
+                "Buyer priority is QUALITY_WARRANTY. Pivoting strategy to 'WARRANTY_EXPANSION_AND_FREIGHT_CONCESSION' "
+                "to secure comprehensive warranty coverage and zero freight costs."
+            )
+            proposals = {
+                "seller_a": BuyerProposal(
+                    target_unit_price=r1_offers["seller_a"].unit_price,
+                    target_delivery_days=10,
+                    target_warranty_months=18,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 30",
+                    rationale="Accepting your unit price if freight shipping is absorbed and warranty is extended.",
+                    concession_requested="Waived freight shipping and 18-month warranty",
+                ),
+                "seller_b": BuyerProposal(
+                    target_unit_price=r1_offers["seller_b"].unit_price,
+                    target_delivery_days=12,
+                    target_warranty_months=24,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 30",
+                    rationale="Respecting engineering value by holding unit price in exchange for 24-month warranty and free freight.",
+                    concession_requested="Extended 24-month warranty and free shipping",
+                ),
+                "seller_c": BuyerProposal(
+                    target_unit_price=round(r1_offers["seller_c"].unit_price - 1.0, 2),
+                    target_delivery_days=5,
+                    target_warranty_months=18,
+                    target_shipping_cost=0.0,
+                    target_payment_terms="Net 60",
+                    rationale="Requesting extended warranty coverage, Net 60 payment terms, and free freight.",
+                    concession_requested="Extended warranty and Net 60 terms",
+                ),
+            }
+        elif discount_percentage >= 0.12 or (self.preferences and self.preferences.priority_type == BuyerPreferencePriority.LOWEST_PRICE):
             chosen_strategy = "PRICE_DISCOUNT"
             reasoning = (
                 f"Sellers demonstrated notable price flexibility in Round 1 (lowest offer ${min_offered_price:.2f}/unit "

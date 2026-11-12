@@ -1,6 +1,75 @@
 """Data models and schemas for multi-agent B2B procurement."""
+from enum import Enum
 from typing import Any
 from pydantic import BaseModel, Field
+
+
+class NegotiationMode(str, Enum):
+    """Negotiation execution mode (Requirement 3)."""
+    DEMO = "DEMO"
+    LIVE_AI = "LIVE_AI"
+
+
+class PaymentMode(str, Enum):
+    """Payment settlement mode (Requirement 3 & 11)."""
+    SIMULATED = "SIMULATED"
+    PAYPAL_SANDBOX = "PAYPAL_SANDBOX"
+
+
+class BuyerPreferencePriority(str, Enum):
+    """High-level procurement objective (Requirement 4)."""
+    BALANCED_VALUE = "BALANCED_VALUE"
+    LOWEST_PRICE = "LOWEST_PRICE"
+    FASTEST_DELIVERY = "FASTEST_DELIVERY"
+    QUALITY_WARRANTY = "QUALITY_WARRANTY"
+    CUSTOM = "CUSTOM"
+
+
+class BuyerConstraints(BaseModel):
+    """Deterministic mandatory constraints that suppliers must strictly satisfy (Requirement 4.1)."""
+    max_budget: float | None = Field(None, gt=0, description="Hard cap on unit price in USD")
+    max_delivery_days: int | None = Field(None, ge=1, description="Latest acceptable delivery in calendar days")
+    min_warranty_months: int | None = Field(None, ge=0, description="Minimum acceptable warranty duration in months")
+    max_shipping_cost: float | None = Field(None, ge=0, description="Maximum acceptable freight cost in USD")
+    allowed_payment_terms: list[str] | None = Field(None, description="Allowed payment terms (e.g. ['Net 30', 'Net 60'])")
+
+
+class BuyerPreferences(BaseModel):
+    """Configurable buyer preferences and trade-offs (Requirement 4.1)."""
+    priority_type: BuyerPreferencePriority = Field(
+        default=BuyerPreferencePriority.BALANCED_VALUE,
+        description="High-level commercial priority"
+    )
+    custom_weights: dict[str, float] | None = Field(
+        default=None,
+        description="Custom evaluation weights if priority_type is CUSTOM"
+    )
+    preferred_payment_terms: str | None = Field(
+        default=None,
+        description="Desired payment terms (preference, not hard requirement)"
+    )
+    constraints: BuyerConstraints = Field(
+        default_factory=BuyerConstraints,
+        description="Mandatory constraints"
+    )
+    source: str = Field(
+        default="explicit",
+        description="Origin of preference: explicit, approved_learning, or system_default"
+    )
+
+
+class LearnedRecommendation(BaseModel):
+    """Consent-based behavioural learning proposal (Requirement 4.4)."""
+    id: str
+    buyer_id: str
+    recommendation_type: str
+    title: str
+    description: str
+    evidence: str
+    suggested_priority: str
+    status: str = "pending"  # pending, accepted, ignored
+    created_at: str
+    updated_at: str
 
 
 class BuyerProposal(BaseModel):
@@ -93,13 +162,15 @@ class PrivateSellerConstraint(BaseModel):
 class CommercialScoreBreakdown(BaseModel):
     """Deterministic commercial evaluation breakdown (Feature 4)."""
     total_score: float = Field(..., ge=0, le=100)
-    price_score: float = Field(..., ge=0, le=40)
-    delivery_score: float = Field(..., ge=0, le=15)
-    warranty_score: float = Field(..., ge=0, le=15)
-    shipping_score: float = Field(..., ge=0, le=10)
-    terms_score: float = Field(..., ge=0, le=10)
-    reliability_score: float = Field(..., ge=0, le=10)
+    price_score: float = Field(..., ge=0, le=60)
+    delivery_score: float = Field(..., ge=0, le=40)
+    warranty_score: float = Field(..., ge=0, le=40)
+    shipping_score: float = Field(..., ge=0, le=20)
+    terms_score: float = Field(..., ge=0, le=20)
+    reliability_score: float = Field(..., ge=0, le=20)
     explanation: str = Field(..., description="Explainable commercial reasoning")
+    is_disqualified: bool = Field(default=False, description="True if mandatory constraints were violated")
+    constraint_violations: list[str] = Field(default_factory=list, description="List of violated hard constraints")
 
 
 class Event(BaseModel):
@@ -125,6 +196,8 @@ class SupplierProfile(BaseModel):
     attempted_deals: int = 0
     accepted_deals: int = 0
     captured_payments: int = 0
+    simulated_deals: int = 0
+    avg_deal_amount: float = 0.0
     reliability_score: float = 1.0
 
 
@@ -142,15 +215,67 @@ class StartRequest(BaseModel):
     product: str = Field(..., min_length=1)
     qty: int = Field(..., gt=0)
     budget: float = Field(..., gt=0)
-    demo_mode: bool = False
+    negotiation_mode: NegotiationMode = Field(default=NegotiationMode.DEMO)
+    payment_mode: PaymentMode = Field(default=PaymentMode.SIMULATED)
+    buyer_id: str = Field(default="default_buyer")
+    preferences: BuyerPreferences | None = None
+    demo_mode: bool | None = None  # Backward-compatible mapping
 
 
 class StatusResponse(BaseModel):
     """Status endpoint payload preserving existing schema while extending it."""
     events: list[dict[str, Any]]
+    session_id: str | None = None
     order_id: str | None = None
     approve_url: str | None = None
     status: str
+    negotiation_mode: str = "DEMO"
+    payment_mode: str = "SIMULATED"
     vendors: list[dict[str, Any]] = Field(default_factory=list)
     deal: dict[str, Any] | None = None
     token_usage: dict[str, Any] | None = None
+    audit_trail: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WhatIfSimulationRequest(BaseModel):
+    """Request parameters for what-if scenario testing (Requirement 9)."""
+    product: str = Field(..., min_length=1)
+    qty: int = Field(..., gt=0)
+    budget: float = Field(..., gt=0)
+    priority_type: BuyerPreferencePriority = BuyerPreferencePriority.BALANCED_VALUE
+    max_delivery_days: int | None = None
+    min_warranty_months: int | None = None
+    weights: dict[str, float] | None = None
+
+
+class WhatIfSimulationResult(BaseModel):
+    """Estimated outcomes per supplier for what-if scenario (Requirement 9)."""
+    product: str
+    qty: int
+    budget: float
+    priority_type: str
+    suppliers: list[dict[str, Any]]
+    recommended_winner: str | None
+    estimated_total_cost: float
+    disclaimer: str = "Simulated estimates only. No Groq tokens spent, no PayPal orders created."
+
+
+class QuoteComparisonItem(BaseModel):
+    """Single vendor quote entry for side-by-side comparison (Requirement 14)."""
+    id: str | None = None
+    supplier_name: str
+    unit_price: float = Field(..., gt=0)
+    quantity: int = Field(..., gt=0)
+    delivery_days: int = Field(..., ge=1)
+    warranty_months: int = Field(..., ge=0)
+    shipping_cost: float = Field(0.0, ge=0)
+    payment_terms: str = "Net 30"
+    special_concessions: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class QuoteComparisonRequest(BaseModel):
+    """Request to compare structured supplier quotes (Requirement 14)."""
+    quotes: list[QuoteComparisonItem]
+    budget_cap: float = Field(..., gt=0)
+    preferences: BuyerPreferences | None = None

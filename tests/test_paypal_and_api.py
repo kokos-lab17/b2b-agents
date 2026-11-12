@@ -29,7 +29,8 @@ class TestPayPalAndAPI(unittest.TestCase):
         }
         response = self.client.post("/api/start", json=payload)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "started"})
+        self.assertEqual(response.json().get("status"), "started")
+        self.assertIn("session_id", response.json())
 
     def test_paypal_client_invalid_offer_rejected(self):
         """Zero or negative price offers must be rejected before making PayPal API calls."""
@@ -134,10 +135,45 @@ class TestPayPalAndAPI(unittest.TestCase):
 
         mock_client.post.side_effect = [token_resp, capture_resp]
 
+        # Mock GET order details returning verified COMPLETED status
+        get_order_resp = MagicMock()
+        get_order_resp.status_code = 200
+        get_order_resp.json.return_value = {
+            "id": "8AB99988877766655",
+            "status": "COMPLETED",
+        }
+        mock_client.get.return_value = get_order_resp
+
         client = PayPalClient(client_id="test_id", secret="test_secret")
         res = client.capture_order("8AB99988877766655")
         self.assertEqual(res["status"], "COMPLETED")
         self.assertTrue(res.get("already_captured"))
+
+    @patch("backend.paypal.httpx.Client")
+    def test_paypal_capture_order_fails_closed_if_verification_fails(self, mock_client_cls):
+        """If PayPal returns 422 ORDER_ALREADY_CAPTURED but verification fails, must fail closed (Requirement 11.4)."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
+        token_resp = MagicMock()
+        token_resp.json.return_value = {"access_token": "mock_token_123"}
+        token_resp.status_code = 200
+
+        capture_resp = MagicMock()
+        capture_resp.status_code = 422
+        capture_resp.text = '{"name":"UNPROCESSABLE_ENTITY","details":[{"issue":"ORDER_ALREADY_CAPTURED"}]}'
+        capture_resp.json.return_value = {
+            "name": "UNPROCESSABLE_ENTITY",
+            "details": [{"issue": "ORDER_ALREADY_CAPTURED"}],
+        }
+
+        mock_client.post.side_effect = [token_resp, capture_resp]
+        mock_client.get.side_effect = Exception("Network timeout during verification")
+
+        client = PayPalClient(client_id="test_id", secret="test_secret")
+        with self.assertRaises(PayPalError) as ctx:
+            client.capture_order("8AB99988877766655")
+        self.assertIn("Failed to independently verify already-captured status", str(ctx.exception))
 
     def test_confirm_payment_invalid_token_regex(self):
         """GET /api/confirm-payment with invalid token returns 400."""
@@ -150,9 +186,10 @@ class TestPayPalAndAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("does not match active pending order", response.json()["detail"])
 
-    def test_confirm_payment_rejects_unmatched_paypal_token(self):
+    @patch("main.get_transaction", return_value=None)
+    def test_confirm_payment_rejects_unmatched_paypal_token(self, mock_get_tx):
         """Reject PayPal token that does not match the active pending order."""
-        response = self.client.get("/api/confirm-payment?token=8AB12345678901234")
+        response = self.client.get("/api/confirm-payment?token=8AB99999999999999")
         self.assertEqual(response.status_code, 400)
         self.assertIn("does not match active pending order", response.json()["detail"])
 
