@@ -145,14 +145,18 @@ type AnalyticsData = {
     captured_payments: number;
     simulated_deals: number;
     avg_deal_amount: number;
-    reliability_score: number;
+    reliability_score: number | null;
+    has_history?: boolean;
+    scoring_prior?: number;
   }>;
   strategies: Array<{
     strategy_name: string;
     total_uses: number;
     concessions_won: number;
-    avg_price_cut: number;
+    avg_price_cut?: number;
+    avg_price_reduction?: number;
     deals_closed: number;
+    confidence_rating?: string;
   }>;
 };
 
@@ -267,13 +271,28 @@ function MessageCell(props: { value?: string }) {
   );
 }
 
+function formatCurrency(val: any, fallback = '—'): string {
+  if (val === null || val === undefined || val === '' || Number.isNaN(Number(val))) return fallback;
+  return `$${Number(val).toFixed(2)}`;
+}
+
+function formatNumber(val: any, decimals = 1, fallback = '—'): string {
+  if (val === null || val === undefined || val === '' || Number.isNaN(Number(val))) return fallback;
+  return Number(val).toFixed(decimals);
+}
+
+function formatPercent(val: any, decimals = 0, fallback = '—'): string {
+  if (val === null || val === undefined || val === '' || Number.isNaN(Number(val))) return fallback;
+  return `${Number(val).toFixed(decimals)}%`;
+}
+
 function OfferCell(props: { value?: number | null }) {
   if (props.value === null || props.value === undefined) {
     return <div className="py-2.5 text-gray-500">—</div>;
   }
   return (
     <div className="py-2.5 tabular-nums font-semibold text-emerald-400">
-      ${Number(props.value).toFixed(2)}
+      {formatCurrency(props.value)}
     </div>
   );
 }
@@ -335,6 +354,7 @@ export default function Home() {
   const [maxDeliveryDays, setMaxDeliveryDays] = useState<string>('');
   const [minWarrantyMonths, setMinWarrantyMonths] = useState<string>('');
   const [maxShippingCost, setMaxShippingCost] = useState<string>('');
+  const [preferredPaymentTerms, setPreferredPaymentTerms] = useState<string>('Net 30');
   const [showAdvancedConstraints, setShowAdvancedConstraints] = useState(false);
 
   // Behavioral Learning Recommendations
@@ -456,6 +476,25 @@ export default function Home() {
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data)) setRecommendations(data);
+      }
+    } catch {}
+  }, []);
+
+  const fetchBuyerProfile = useCallback(async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/buyer/profile?buyer_id=default_buyer`, { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        const eff = data?.effective_preferences || data?.saved_preferences;
+        if (eff) {
+          if (eff.priority_type) setPriorityType(eff.priority_type);
+          if (eff.preferred_payment_terms) setPreferredPaymentTerms(eff.preferred_payment_terms);
+          if (eff.constraints) {
+            if (eff.constraints.max_delivery_days) setMaxDeliveryDays(String(eff.constraints.max_delivery_days));
+            if (eff.constraints.min_warranty_months) setMinWarrantyMonths(String(eff.constraints.min_warranty_months));
+            if (eff.constraints.max_shipping_cost) setMaxShippingCost(String(eff.constraints.max_shipping_cost));
+          }
+        }
       }
     } catch {}
   }, []);
@@ -715,9 +754,26 @@ export default function Home() {
     [applyStatusResponse, currentSessionId, fetchRecommendations]
   );
 
+  const restoreLatestSession = useCallback(async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/status`, { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (mountedRef.current && data && data.status !== 'idle' && (data.events?.length > 0 || data.deal)) {
+          applyStatusResponse(data);
+          if (data.session_id) {
+            setCurrentSessionId(data.session_id);
+            activeSessionIdRef.current = data.session_id;
+          }
+        }
+      }
+    } catch {}
+  }, [applyStatusResponse]);
+
   useEffect(() => {
     mountedRef.current = true;
     fetchRecommendations();
+    fetchBuyerProfile();
 
     // Detect PayPal return or cancellation
     if (typeof window !== 'undefined') {
@@ -735,6 +791,8 @@ export default function Home() {
       } else if (tokenParam && !isCancelled) {
         setOrderId(tokenParam);
         executePaymentCapture(tokenParam);
+      } else {
+        restoreLatestSession();
       }
     }
 
@@ -745,7 +803,7 @@ export default function Home() {
         pollRef.current = null;
       }
     };
-  }, [executePaymentCapture, fetchRecommendations]);
+  }, [executePaymentCapture, fetchRecommendations, fetchBuyerProfile, restoreLatestSession]);
 
   // When switching tabs, auto-fetch tab data
   useEffect(() => {
@@ -798,12 +856,13 @@ export default function Home() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
       try {
+        const effectivePaymentMode = negotiationMode === 'LIVE_AI' ? 'PAYPAL_SANDBOX' : paymentMode;
         const payload: Record<string, any> = {
           product: product.trim(),
           qty: Math.floor(Number(qty)),
           budget: Number(budget),
           negotiation_mode: negotiationMode,
-          payment_mode: paymentMode,
+          payment_mode: effectivePaymentMode,
           demo_mode: negotiationMode === 'DEMO',
           buyer_id: 'default_buyer',
           preferences: {
@@ -813,7 +872,7 @@ export default function Home() {
               min_warranty_months: minWarrantyMonths ? Number(minWarrantyMonths) : null,
               max_shipping_cost: maxShippingCost ? Number(maxShippingCost) : null,
             },
-            preferred_payment_terms: 'Net 30',
+            preferred_payment_terms: preferredPaymentTerms || 'Net 30',
           },
         };
 
@@ -998,7 +1057,10 @@ export default function Home() {
                 <div className="flex items-center gap-1.5 rounded-lg border border-gray-800 bg-gray-950 p-1 text-xs">
                   <button
                     type="button"
-                    onClick={() => setNegotiationMode('DEMO')}
+                    onClick={() => {
+                      setNegotiationMode('DEMO');
+                      setPaymentMode('SIMULATED');
+                    }}
                     className={`rounded px-3 py-1.5 font-medium transition-colors ${
                       negotiationMode === 'DEMO'
                         ? 'bg-purple-600 text-white shadow-sm'
@@ -1009,7 +1071,10 @@ export default function Home() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setNegotiationMode('LIVE_AI')}
+                    onClick={() => {
+                      setNegotiationMode('LIVE_AI');
+                      setPaymentMode('PAYPAL_SANDBOX');
+                    }}
                     className={`rounded px-3 py-1.5 font-medium transition-colors ${
                       negotiationMode === 'LIVE_AI'
                         ? 'bg-blue-600 text-white shadow-sm'
@@ -1025,30 +1090,37 @@ export default function Home() {
                 <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">
                   Payment Mode:
                 </span>
-                <div className="flex items-center gap-1.5 rounded-lg border border-gray-800 bg-gray-950 p-1 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMode('SIMULATED')}
-                    className={`rounded px-3 py-1.5 font-medium transition-colors ${
-                      paymentMode === 'SIMULATED'
-                        ? 'bg-teal-600 text-white shadow-sm'
-                        : 'text-gray-400 hover:text-gray-200'
-                    }`}
-                  >
-                    Simulated Settlement
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMode('PAYPAL_SANDBOX')}
-                    className={`rounded px-3 py-1.5 font-medium transition-colors ${
-                      paymentMode === 'PAYPAL_SANDBOX'
-                        ? 'bg-green-600 text-white shadow-sm'
-                        : 'text-gray-400 hover:text-gray-200'
-                    }`}
-                  >
-                    PayPal Sandbox Checkout
-                  </button>
-                </div>
+                {negotiationMode === 'LIVE_AI' ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-950/20 px-3 py-1.5 text-xs text-green-300">
+                    <span className="font-semibold text-white">PayPal Sandbox Checkout</span>
+                    <span className="text-[10px] text-green-400/80">(Required for Live AI)</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 rounded-lg border border-gray-800 bg-gray-950 p-1 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setPaymentMode('SIMULATED')}
+                      className={`rounded px-3 py-1.5 font-medium transition-colors ${
+                        paymentMode === 'SIMULATED'
+                          ? 'bg-teal-600 text-white shadow-sm'
+                          : 'text-gray-400 hover:text-gray-200'
+                      }`}
+                    >
+                      Simulated Settlement
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPaymentMode('PAYPAL_SANDBOX')}
+                      className={`rounded px-3 py-1.5 font-medium transition-colors ${
+                        paymentMode === 'PAYPAL_SANDBOX'
+                          ? 'bg-green-600 text-white shadow-sm'
+                          : 'text-gray-400 hover:text-gray-200'
+                      }`}
+                    >
+                      PayPal Sandbox Checkout
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1377,10 +1449,10 @@ export default function Home() {
                           <div className="text-right">
                             <span className="text-[10px] uppercase tracking-wider text-gray-400">Score</span>
                             <div className={`text-xl font-black ${isWinner ? 'text-cyan-300' : 'text-gray-300'}`}>
-                              {offer.commercial_score
-                                ? offer.commercial_score.toFixed(1)
-                                : isWinner && deal?.commercial_score
-                                ? deal.commercial_score.toFixed(1)
+                              {offer.commercial_score !== null && offer.commercial_score !== undefined
+                                ? formatNumber(offer.commercial_score, 1)
+                                : isWinner && deal?.commercial_score !== null && deal?.commercial_score !== undefined
+                                ? formatNumber(deal.commercial_score, 1)
                                 : '—'}
                               <span className="text-xs font-normal text-gray-500">/100</span>
                             </div>
@@ -1392,11 +1464,11 @@ export default function Home() {
                           <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
                             <span className="text-gray-400 text-[11px]">Final Unit Price</span>
                             <div className="mt-0.5 font-bold text-emerald-400 text-sm">
-                              ${offer.unit_price.toFixed(2)}
+                              {formatCurrency(offer.unit_price)}
                             </div>
                             {offer.initial_unit_price && offer.initial_unit_price > offer.unit_price && (
                               <div className="text-[10px] text-emerald-500/80">
-                                ↓ ${offer.price_reduction?.toFixed(2)} (-{offer.price_reduction_pct?.toFixed(1)}%)
+                                ↓ {formatCurrency(offer.price_reduction)} (-{formatPercent(offer.price_reduction_pct, 1)})
                               </div>
                             )}
                           </div>
@@ -1404,7 +1476,7 @@ export default function Home() {
                           <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
                             <span className="text-gray-400 text-[11px]">Total Order</span>
                             <div className="mt-0.5 font-bold text-white text-sm">
-                              ${offer.total_price.toFixed(2)}
+                              {formatCurrency(offer.total_price)}
                             </div>
                             <div className="text-[10px] text-gray-500">
                               for {qty || 500} units
@@ -1428,7 +1500,7 @@ export default function Home() {
                           <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
                             <span className="text-gray-400 text-[11px]">Freight</span>
                             <div className="mt-0.5 font-bold text-white text-sm">
-                              {offer.shipping_cost <= 0 ? 'FREE ($0)' : `$${offer.shipping_cost.toFixed(2)}`}
+                              {offer.shipping_cost <= 0 ? 'FREE ($0)' : formatCurrency(offer.shipping_cost)}
                             </div>
                           </div>
 
@@ -1519,40 +1591,40 @@ export default function Home() {
                       <div className="rounded-lg border border-gray-800 bg-gray-900/90 p-3">
                         <span className="text-[11px] uppercase tracking-wider text-gray-400">Final Deal Total</span>
                         <div className="mt-1 text-xl font-extrabold text-white">
-                          ${bi.final_deal_total.toFixed(2)}
+                          {formatCurrency(bi.final_deal_total)}
                         </div>
                         <div className="text-[11px] text-gray-400">
-                          ${bi.unit_price.toFixed(2)} / unit
+                          {formatCurrency(bi.unit_price)} / unit
                         </div>
                       </div>
 
                       <div className="rounded-lg border border-gray-800 bg-gray-900/90 p-3">
                         <span className="text-[11px] uppercase tracking-wider text-gray-400">Budget Utilization</span>
                         <div className="mt-1 text-xl font-extrabold text-blue-400">
-                          {bi.budget_utilization_pct.toFixed(1)}%
+                          {formatPercent(bi.budget_utilization_pct, 1)}
                         </div>
                         <div className="text-[11px] text-gray-400">
-                          Budget Cap: ${bi.budget_total.toFixed(2)}
+                          Budget Cap: {formatCurrency(bi.budget_total)}
                         </div>
                       </div>
 
                       <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/20 p-3">
                         <span className="text-[11px] uppercase tracking-wider text-emerald-400">Budget Headroom</span>
                         <div className="mt-1 text-xl font-extrabold text-emerald-400">
-                          ${bi.budget_headroom.toFixed(2)}
+                          {formatCurrency(bi.budget_headroom)}
                         </div>
                         <div className="text-[11px] text-emerald-300/80">
-                          Unspent budget (${bi.budget_headroom_unit.toFixed(2)}/u)
+                          Unspent budget ({formatCurrency(bi.budget_headroom_unit)}/u)
                         </div>
                       </div>
 
                       <div className="rounded-lg border border-purple-500/30 bg-purple-950/20 p-3">
                         <span className="text-[11px] uppercase tracking-wider text-purple-400">Negotiated Savings</span>
                         <div className="mt-1 text-xl font-extrabold text-purple-300">
-                          ${bi.negotiated_savings.toFixed(2)}
+                          {formatCurrency(bi.negotiated_savings)}
                         </div>
                         <div className="text-[11px] text-purple-300/80">
-                          Cut vs opening quote (${bi.negotiated_savings_unit.toFixed(2)}/u)
+                          Cut vs opening quote ({formatCurrency(bi.negotiated_savings_unit)}/u)
                         </div>
                       </div>
                     </div>
@@ -1674,9 +1746,13 @@ export default function Home() {
                   >
                     <div className="flex items-center justify-between">
                       <p className="font-semibold text-white">{v.name}</p>
-                      {typeof v.reliability_score === 'number' && (
+                      {typeof v.reliability_score === 'number' ? (
                         <span className="rounded bg-blue-500/10 px-2 py-0.5 text-xs font-medium text-blue-300">
-                          {(v.reliability_score * 100).toFixed(0)}% Reliability
+                          {formatPercent(v.reliability_score * 100)} Reliability
+                        </span>
+                      ) : (
+                        <span className="rounded bg-gray-700/30 px-2 py-0.5 text-xs font-medium text-gray-400">
+                          New Supplier (Baseline)
                         </span>
                       )}
                     </div>
@@ -1723,7 +1799,7 @@ export default function Home() {
                 <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-sm">
                   <span className="text-xs text-gray-400">PayPal Sandbox Spend</span>
                   <p className="mt-1 text-2xl font-black text-green-400">
-                    ${analytics.overall.total_sandbox_spend.toFixed(2)}
+                    {formatCurrency(analytics.overall.total_sandbox_spend)}
                   </p>
                   <p className="mt-1 text-xs text-gray-500">
                     {analytics.overall.sandbox_orders_count} Real Sandbox Orders
@@ -1732,7 +1808,7 @@ export default function Home() {
                 <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-sm">
                   <span className="text-xs text-gray-400">Simulated Deal Spend</span>
                   <p className="mt-1 text-2xl font-black text-teal-400">
-                    ${analytics.overall.total_simulated_spend.toFixed(2)}
+                    {formatCurrency(analytics.overall.total_simulated_spend)}
                   </p>
                   <p className="mt-1 text-xs text-gray-500">
                     {analytics.overall.simulated_orders_count} Simulated Deals
@@ -1741,7 +1817,7 @@ export default function Home() {
                 <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-sm">
                   <span className="text-xs text-gray-400">Negotiated Savings</span>
                   <p className="mt-1 text-2xl font-black text-cyan-400">
-                    ${analytics.overall.total_savings.toFixed(2)}
+                    {formatCurrency(analytics.overall.total_savings)}
                   </p>
                   <p className="mt-1 text-xs text-gray-500">Saved vs Initial Budget</p>
                 </div>
@@ -1782,11 +1858,17 @@ export default function Home() {
                           <td className="py-2.5 text-gray-300">{m.accepted_deals}</td>
                           <td className="py-2.5 font-semibold text-green-400">{m.captured_payments}</td>
                           <td className="py-2.5 font-semibold text-teal-400">{m.simulated_deals}</td>
-                          <td className="py-2.5 text-gray-300">${m.avg_deal_amount.toFixed(2)}</td>
+                          <td className="py-2.5 text-gray-300">{formatCurrency(m.avg_deal_amount)}</td>
                           <td className="py-2.5">
-                            <span className="rounded bg-blue-500/10 px-2 py-0.5 font-medium text-blue-300">
-                              {(m.reliability_score * 100).toFixed(0)}%
-                            </span>
+                            {typeof m.reliability_score === 'number' ? (
+                              <span className="rounded bg-blue-500/10 px-2 py-0.5 font-medium text-blue-300">
+                                {formatPercent(m.reliability_score * 100)}
+                              </span>
+                            ) : (
+                              <span className="rounded bg-gray-700/30 px-2 py-0.5 text-[11px] font-medium text-gray-400">
+                                No history (New)
+                              </span>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -1820,11 +1902,11 @@ export default function Home() {
                           <tr key={st.strategy_name} className="hover:bg-gray-800/20">
                             <td className="py-2.5 font-medium text-purple-300">{st.strategy_name}</td>
                             <td className="py-2.5 text-gray-300">{st.total_uses}</td>
-                            <td className="py-2.5 text-gray-300">{st.concessions_won}</td>
-                            <td className="py-2.5 text-emerald-400 font-semibold">${st.avg_price_cut.toFixed(2)}</td>
-                            <td className="py-2.5 text-gray-300">{st.deals_closed}</td>
+                            <td className="py-2.5 text-gray-300">{st.concessions_won ?? 0}</td>
+                            <td className="py-2.5 text-emerald-400 font-semibold">{formatCurrency(st.avg_price_cut ?? st.avg_price_reduction)}</td>
+                            <td className="py-2.5 text-gray-300">{st.deals_closed ?? 0}</td>
                             <td className="py-2.5 font-semibold text-white">
-                              {st.total_uses > 0 ? `${((st.deals_closed / st.total_uses) * 100).toFixed(0)}%` : '0%'}
+                              {st.total_uses > 0 ? formatPercent(((st.deals_closed ?? 0) / st.total_uses) * 100) : '0%'}
                             </td>
                           </tr>
                         ))}
@@ -1920,7 +2002,7 @@ export default function Home() {
                   type="number"
                   placeholder="Optional constraint"
                   value={simMinWarranty}
-                  onChange={(e) => setMinWarrantyMonths(e.target.value)}
+                  onChange={(e) => setSimMinWarranty(e.target.value)}
                   className="w-full rounded border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white outline-none focus:border-blue-500"
                 />
               </div>
@@ -1945,7 +2027,7 @@ export default function Home() {
                 <span className="font-semibold text-purple-300">Recommended Winner: </span>
                 <strong className="text-white text-sm">{simResult.recommended_winner}</strong>
                 <span className="ml-4 text-gray-400">
-                  Estimated Total Cost: <strong className="text-emerald-400">${simResult.estimated_total_cost.toFixed(2)}</strong>
+                  Estimated Total Cost: <strong className="text-emerald-400">{formatCurrency(simResult.estimated_total_cost)}</strong>
                 </span>
                 <p className="mt-1 text-gray-400 italic">{simResult.disclaimer}</p>
               </div>
@@ -1965,7 +2047,7 @@ export default function Home() {
                     <div className="flex items-center justify-between">
                       <p className="font-bold text-white text-sm">{s.supplier_name}</p>
                       <span className="rounded bg-gray-800 px-2 py-0.5 text-[10px] text-gray-300">
-                        Score: {s.commercial_score.toFixed(1)}
+                        Score: {formatNumber(s.commercial_score, 1)}
                       </span>
                     </div>
                     <p className="text-gray-400 text-[11px] mt-0.5">{s.archetype}</p>
@@ -1973,7 +2055,7 @@ export default function Home() {
                     <div className="mt-3 space-y-1.5 border-t border-gray-800/80 pt-2 text-gray-300">
                       <div className="flex justify-between">
                         <span>Unit Price:</span>
-                        <strong className="text-emerald-400">${s.estimated_unit_price.toFixed(2)}</strong>
+                        <strong className="text-emerald-400">{formatCurrency(s.estimated_unit_price)}</strong>
                       </div>
                       <div className="flex justify-between">
                         <span>Lead Time:</span>
@@ -1985,7 +2067,7 @@ export default function Home() {
                       </div>
                       <div className="flex justify-between">
                         <span>Freight:</span>
-                        <span>{s.estimated_shipping_cost <= 0 ? 'FREE' : `$${s.estimated_shipping_cost.toFixed(2)}`}</span>
+                        <span>{s.estimated_shipping_cost <= 0 ? 'FREE' : formatCurrency(s.estimated_shipping_cost)}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Terms:</span>
@@ -2060,10 +2142,10 @@ export default function Home() {
                 {quoteItems.map((q, idx) => (
                   <tr key={idx} className="hover:bg-gray-800/20">
                     <td className="py-2.5 font-semibold text-white">{q.supplier_name}</td>
-                    <td className="py-2.5 font-bold text-emerald-400">${q.unit_price.toFixed(2)}</td>
+                    <td className="py-2.5 font-bold text-emerald-400">{formatCurrency(q.unit_price)}</td>
                     <td className="py-2.5 text-gray-300">{q.delivery_days} days</td>
                     <td className="py-2.5 text-purple-300">{q.warranty_months} mos</td>
-                    <td className="py-2.5 text-gray-300">{q.shipping_cost <= 0 ? 'FREE' : `$${q.shipping_cost.toFixed(2)}`}</td>
+                    <td className="py-2.5 text-gray-300">{q.shipping_cost <= 0 ? 'FREE' : formatCurrency(q.shipping_cost)}</td>
                     <td className="py-2.5 text-blue-300">{q.payment_terms}</td>
                     <td className="py-2.5 text-gray-400">{q.special_concessions?.join(', ') || '—'}</td>
                   </tr>
@@ -2085,7 +2167,7 @@ export default function Home() {
                 <div className="text-right">
                   <span className="text-xs text-gray-400">Evaluation Score</span>
                   <p className="text-xl font-bold text-blue-300">
-                    {quoteComparisonResult.best_score?.toFixed(1) || '0.0'} / 100
+                    {formatNumber(quoteComparisonResult.best_score, 1, '0.0')} / 100
                   </p>
                 </div>
               </div>
@@ -2105,7 +2187,7 @@ export default function Home() {
                   >
                     <div className="flex items-center justify-between">
                       <p className="font-semibold text-white">{c.supplier_name}</p>
-                      <span className="font-bold text-blue-300">{c.commercial_score.toFixed(1)} pts</span>
+                      <span className="font-bold text-blue-300">{formatNumber(c.commercial_score, 1)} pts</span>
                     </div>
                     {c.is_disqualified ? (
                       <p className="mt-2 text-red-300 text-[11px]">

@@ -36,7 +36,7 @@ class Settings:
 
     # CORS and Host
     FRONTEND_ALLOWED_ORIGIN: str = os.getenv("FRONTEND_ALLOWED_ORIGIN", "*").strip()
-    FRONTEND_URL: str = (os.getenv("FRONTEND_URL") or "https://b2b-agents.onrender.com").strip().rstrip("/")
+    FRONTEND_URL: str = (os.getenv("FRONTEND_URL") or "http://localhost:3000").strip().rstrip("/")
 
 
 settings = Settings()

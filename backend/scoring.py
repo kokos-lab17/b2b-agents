@@ -63,7 +63,7 @@ class ScoringWeights:
 def score_offer(
     offer: CommercialOffer,
     budget_cap: float,
-    reliability_score: float = 0.90,
+    reliability_score: float | None = None,
     weights: ScoringWeights | None = None,
     preferences: BuyerPreferences | None = None,
 ) -> CommercialScoreBreakdown:
@@ -130,8 +130,9 @@ def score_offer(
             terms_score = w.PAYMENT_TERMS
     terms_score = round(min(w.PAYMENT_TERMS, terms_score), 2)
 
-    # 6. Supplier Reliability
-    rel = max(0.0, min(1.0, reliability_score))
+    # 6. Supplier Reliability (historical reliability if known, or neutral 0.85 prior)
+    effective_rel = 0.85 if reliability_score is None else reliability_score
+    rel = max(0.0, min(1.0, effective_rel))
     reliability_score_pts = round(rel * w.RELIABILITY, 2)
 
     calculated_total = round(
@@ -169,7 +170,7 @@ def score_offer(
         f"Warranty of {offer.warranty_months} months contributes {warranty_score}/{w.WARRANTY:.0f} pts.",
         f"Shipping cost of ${offer.shipping_cost:.2f} contributes {shipping_score}/{w.SHIPPING:.0f} pts.",
         f"Payment terms '{offer.payment_terms}' contribute {terms_score}/{w.PAYMENT_TERMS:.0f} pts.",
-        f"Supplier historical reliability ({rel * 100:.0f}%) contributes {reliability_score_pts}/{w.RELIABILITY:.0f} pts.",
+        f"Supplier {'historical reliability' if reliability_score is not None else 'baseline prior'} ({rel * 100:.0f}%) contributes {reliability_score_pts}/{w.RELIABILITY:.0f} pts.",
     ]
     explanation = " | ".join(explanation_parts)
     if is_disqualified:

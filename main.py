@@ -1,6 +1,7 @@
 """Main FastAPI application for Autonomous Multi-Agent B2B Procurement."""
 import asyncio
 import concurrent.futures
+import json
 import logging
 import re
 import threading
@@ -23,6 +24,7 @@ from backend.buyer_preferences import (
 )
 from backend.config import settings
 from backend.memory import (
+    get_latest_session,
     get_overall_procurement_analytics,
     get_session,
     get_session_audit_trail,
@@ -33,6 +35,7 @@ from backend.memory import (
     record_payment_captured,
     record_session,
     record_session_event,
+    record_session_result,
 )
 from backend.models import (
     BuyerPreferencePriority,
@@ -100,29 +103,48 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
                 "payment_mode": s.get("payment_mode", "SIMULATED"),
             }
 
-    # If not active in memory, attempt database fallback
-    if target_id:
-        db_s = get_session(target_id)
-        if db_s:
-            db_events = get_session_events(target_id)
-            return {
-                "session_id": target_id,
-                "events": db_events,
-                "order_id": None,
-                "approve_url": None,
-                "status": db_s.get("status", "completed"),
-                "vendors": [],
-                "deal": None,
-                "final_offers": [],
-                "winning_vendor": None,
-                "winning_offer": None,
-                "buyer_intelligence": None,
-                "last_heartbeat": None,
-                "updated_at": None,
-                "token_usage": None,
-                "negotiation_mode": db_s.get("negotiation_mode", "DEMO"),
-                "payment_mode": db_s.get("payment_mode", "SIMULATED"),
-            }
+    # If not active in memory, attempt database fallback (target_id or latest session from DB)
+    db_s = get_session(target_id) if target_id else get_latest_session()
+    if db_s:
+        sid = db_s["id"]
+        db_events = get_session_events(sid)
+        deal_data = None
+        if db_s.get("deal_json"):
+            try:
+                deal_data = json.loads(db_s["deal_json"])
+            except Exception:
+                pass
+        final_offers_data = []
+        if db_s.get("final_offers_json"):
+            try:
+                final_offers_data = json.loads(db_s["final_offers_json"])
+            except Exception:
+                pass
+        intel_data = None
+        if db_s.get("buyer_intelligence_json"):
+            try:
+                intel_data = json.loads(db_s["buyer_intelligence_json"])
+            except Exception:
+                pass
+
+        return {
+            "session_id": sid,
+            "events": db_events,
+            "order_id": db_s.get("order_id"),
+            "approve_url": db_s.get("approve_url"),
+            "status": db_s.get("status", "completed"),
+            "vendors": [],
+            "deal": deal_data,
+            "final_offers": final_offers_data,
+            "winning_vendor": db_s.get("selected_supplier"),
+            "winning_offer": deal_data,
+            "buyer_intelligence": intel_data,
+            "last_heartbeat": None,
+            "updated_at": db_s.get("updated_at"),
+            "token_usage": None,
+            "negotiation_mode": db_s.get("negotiation_mode", "DEMO"),
+            "payment_mode": db_s.get("payment_mode", "SIMULATED"),
+        }
 
     # Default idle state
     return {
@@ -192,12 +214,15 @@ def _run_procurement_worker(
             on_vendors=on_vendors,
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(engine.run)
-            try:
-                result = future.result(timeout=25.0)
-            except concurrent.futures.TimeoutError:
-                raise TimeoutError("Negotiation worker timed out after 25 seconds.")
+            result = future.result(timeout=25.0)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("Negotiation worker timed out after 25 seconds.")
+        else:
+            executor.shutdown(wait=False)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         with _lock:
@@ -216,6 +241,20 @@ def _run_procurement_worker(
                 s["updated_at"] = now_iso
                 if result.get("vendors"):
                     s["vendors"] = result["vendors"]
+
+        # Persist complete outcome to SQLite for persistent recovery across reloads
+        winning_deal = result.get("deal")
+        record_session_result(
+            session_id=session_id,
+            status=result.get("status", "awaiting_approval"),
+            deal=winning_deal,
+            final_offers=result.get("final_offers", []),
+            buyer_intelligence=result.get("buyer_intelligence"),
+            order_id=result.get("order_id"),
+            approve_url=result.get("approve_url"),
+            selected_supplier=result.get("winning_vendor"),
+            total_cost=winning_deal.get("total_cost") if winning_deal else None,
+        )
 
         logger.info(
             "[%s] Stage 11: Worker completed successfully. Status: %s",
@@ -413,6 +452,32 @@ async def confirm_payment(
         order_details = await asyncio.to_thread(client.get_order_details, token)
         order_status = order_details.get("status")
 
+        # Validate currency and amount against the expected commercial deal BEFORE capture/completion
+        if tx and tx.get("amount") is not None:
+            expected_amount = float(tx["amount"])
+            purchase_units = order_details.get("purchase_units", [])
+            if not purchase_units:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Order '{token}' missing purchase units.",
+                )
+            unit_amount_info = purchase_units[0].get("amount", {})
+            currency_code = unit_amount_info.get("currency_code", "USD")
+            order_value = float(unit_amount_info.get("value", 0.0))
+            if currency_code != "USD":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Currency mismatch for order '{token}': Expected 'USD', found '{currency_code}'.",
+                )
+            if abs(order_value - expected_amount) > 0.01:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Amount mismatch for order '{token}': Expected ${expected_amount:.2f}, "
+                        f"PayPal order is ${order_value:.2f}."
+                    ),
+                )
+
         # If already captured on PayPal, record and return idempotent success
         if order_status == "COMPLETED":
             record_payment_captured(token)
@@ -429,28 +494,6 @@ async def confirm_payment(
                     "expected 'APPROVED'. Buyer has not approved this order on PayPal yet."
                 ),
             )
-
-        # Validate currency and amount against the expected commercial deal
-        if tx and tx.get("amount") is not None:
-            expected_amount = float(tx["amount"])
-            purchase_units = order_details.get("purchase_units", [])
-            if purchase_units:
-                unit_amount_info = purchase_units[0].get("amount", {})
-                currency_code = unit_amount_info.get("currency_code", "USD")
-                order_value = float(unit_amount_info.get("value", 0.0))
-                if currency_code != "USD":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Currency mismatch for order '{token}': Expected 'USD', found '{currency_code}'.",
-                    )
-                if abs(order_value - expected_amount) > 0.01:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Amount mismatch for order '{token}': Expected ${expected_amount:.2f}, "
-                            f"PayPal order is ${order_value:.2f}."
-                        ),
-                    )
 
         # Step 2: Capture verified order only after buyer approval and terms validation
         capture_result = await asyncio.to_thread(client.capture_order, token)

@@ -413,17 +413,26 @@ class NegotiationEngine:
             winning_breakdown.total_score,
         )
 
-        # Record strategy outcomes for procurement intelligence
-        for c in scored_candidates:
-            is_winner = (c["key"] == winner["key"])
-            record_strategy_outcome(
-                session_id=self.session_id,
-                strategy=current_strategy,
-                supplier_name=c["name"],
-                initial_price=round1_offers[c["key"]].unit_price,
-                final_price=c["offer"].unit_price,
-                won=is_winner,
-            )
+        # Record strategy outcome for procurement intelligence (1 per session, based on winning deal & concessions)
+        winner_key = winner["key"]
+        winner_r1_price = round1_offers[winner_key].unit_price
+        winner_final_price = winner["offer"].unit_price
+        any_concession = any(
+            round1_offers[c["key"]].unit_price > c["offer"].unit_price or
+            round1_offers[c["key"]].shipping_cost > c["offer"].shipping_cost or
+            round1_offers[c["key"]].delivery_days > c["offer"].delivery_days or
+            round1_offers[c["key"]].warranty_months < c["offer"].warranty_months
+            for c in scored_candidates
+        )
+        record_strategy_outcome(
+            session_id=self.session_id,
+            strategy=current_strategy,
+            supplier_name=winning_name,
+            initial_price=winner_r1_price,
+            final_price=winner_final_price,
+            concession_obtained=any_concession,
+            won=True,
+        )
 
         # Build 3-Supplier Comparison Summary
         final_offers_summary: list[dict[str, Any]] = []

@@ -64,6 +64,11 @@ def init_db(db_path: str | None = None) -> None:
                 _add_column_if_missing(conn, "procurement_sessions", "payment_mode TEXT DEFAULT 'SIMULATED'")
                 _add_column_if_missing(conn, "procurement_sessions", "buyer_id TEXT DEFAULT 'default_buyer'")
                 _add_column_if_missing(conn, "procurement_sessions", "priority_type TEXT DEFAULT 'BALANCED_VALUE'")
+                _add_column_if_missing(conn, "procurement_sessions", "deal_json TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "final_offers_json TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "buyer_intelligence_json TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "order_id TEXT")
+                _add_column_if_missing(conn, "procurement_sessions", "approve_url TEXT")
 
                 # 3. Negotiation records per round
                 conn.execute("""
@@ -274,6 +279,65 @@ def record_session(
                     negotiation_mode, payment_mode, buyer_id, priority_type,
                     now, now
                 ))
+        finally:
+            conn.close()
+
+
+def record_session_result(
+    session_id: str,
+    status: str,
+    deal: dict[str, Any] | None = None,
+    final_offers: list[dict[str, Any]] | None = None,
+    buyer_intelligence: dict[str, Any] | None = None,
+    order_id: str | None = None,
+    approve_url: str | None = None,
+    selected_supplier: str | None = None,
+    total_cost: float | None = None,
+    db_path: str | None = None,
+) -> None:
+    """Persist completed or awaiting_approval session results so sessions can be recovered from DB."""
+    with _db_lock:
+        conn = _get_connection(db_path)
+        try:
+            with conn:
+                now = datetime.now(timezone.utc).isoformat()
+                deal_json = json.dumps(deal) if deal else None
+                offers_json = json.dumps(final_offers) if final_offers else None
+                intel_json = json.dumps(buyer_intelligence) if buyer_intelligence else None
+                cur = conn.execute("""
+                    UPDATE procurement_sessions
+                    SET status = ?,
+                        deal_json = COALESCE(?, deal_json),
+                        final_offers_json = COALESCE(?, final_offers_json),
+                        buyer_intelligence_json = COALESCE(?, buyer_intelligence_json),
+                        order_id = COALESCE(?, order_id),
+                        approve_url = COALESCE(?, approve_url),
+                        selected_supplier = COALESCE(?, selected_supplier),
+                        total_cost = COALESCE(?, total_cost),
+                        updated_at = ?
+                    WHERE id = ?;
+                """, (
+                    status, deal_json, offers_json, intel_json,
+                    order_id, approve_url, selected_supplier, total_cost,
+                    now, session_id
+                ))
+                if cur.rowcount == 0:
+                    conn.execute("""
+                        INSERT INTO procurement_sessions (
+                            id, product, qty, budget, status, selected_supplier, total_cost,
+                            deal_json, final_offers_json, buyer_intelligence_json, order_id, approve_url,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (
+                        session_id,
+                        deal.get("product", "Procured Item") if deal else "Procured Item",
+                        deal.get("quantity", 100) if deal else 100,
+                        deal.get("unit_price", 0.0) if deal else 0.0,
+                        status, selected_supplier, total_cost,
+                        deal_json, offers_json, intel_json, order_id, approve_url,
+                        now, now
+                    ))
         finally:
             conn.close()
 
@@ -601,10 +665,10 @@ def get_strategy_metrics(db_path: str | None = None) -> list[dict[str, Any]]:
                 cur = conn.execute("""
                     SELECT
                         strategy_name,
-                        COUNT(*) as total_uses,
-                        SUM(concession_obtained) as concessions_won,
+                        COUNT(DISTINCT session_id) as total_uses,
+                        COUNT(DISTINCT CASE WHEN concession_obtained = 1 THEN session_id END) as concessions_won,
                         AVG(price_reduction) as avg_price_cut,
-                        SUM(deal_won) as deals_closed
+                        COUNT(DISTINCT CASE WHEN deal_won = 1 THEN session_id END) as deals_closed
                     FROM strategy_records
                     GROUP BY strategy_name;
                 """)
@@ -623,6 +687,7 @@ def get_strategy_metrics(db_path: str | None = None) -> list[dict[str, Any]]:
                         "concessions_won": concessions,
                         "success_rate_pct": success_rate,
                         "avg_price_reduction": avg_cut,
+                        "avg_price_cut": avg_cut,
                         "deals_closed": deals,
                         "confidence_rating": confidence,
                     })
@@ -676,13 +741,16 @@ def get_supplier_metrics(supplier_name: str, db_path: str | None = None) -> dict
                 avg_deal_amount = round(avg_amount_row["avg_deal_amount"], 2) if avg_amount_row and avg_amount_row["avg_deal_amount"] else 0.0
 
                 # Genuine reliability score: calculated strictly on real transactions
-                if attempts == 0:
-                    reliability = 0.90
+                has_history = attempts > 0
+                if not has_history:
+                    reliability = None
+                    scoring_prior = 0.85
                 else:
                     conversion = accepted / attempts if attempts > 0 else 0.5
                     # Reliability is influenced by conversion and real settlement reliability
                     sandbox_ratio = sandbox_captured / accepted if accepted > 0 else 0.8
                     reliability = round(min(1.0, max(0.5, 0.70 + 0.15 * conversion + 0.15 * sandbox_ratio)), 2)
+                    scoring_prior = reliability
 
                 return {
                     "supplier_name": supplier_name,
@@ -692,6 +760,8 @@ def get_supplier_metrics(supplier_name: str, db_path: str | None = None) -> dict
                     "simulated_deals": simulated_captured,
                     "avg_deal_amount": avg_deal_amount,
                     "reliability_score": reliability,
+                    "has_history": has_history,
+                    "scoring_prior": scoring_prior,
                 }
         finally:
             conn.close()

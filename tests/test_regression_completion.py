@@ -434,6 +434,134 @@ class TestRegressionProcurementCompletion(unittest.TestCase):
         self.assertEqual(c2.json()["status"], "captured")
         self.assertTrue(c2.json().get("already_captured", False))
 
+    def test_17_sqlite_session_recovery_when_cleared_from_memory(self):
+        """17. SQLite session persistence recovers deal, final offers, and buyer intelligence when memory cleared."""
+        session_id = f"test-persist-{uuid.uuid4().hex[:8]}"
+        engine = NegotiationEngine(
+            product="Conveyor Belts",
+            qty=100,
+            budget=60.0,
+            demo_mode=True,
+            payment_mode=PaymentMode.SIMULATED,
+            session_id=session_id,
+        )
+        res = engine.run()
+        # Persist full result to SQLite
+        from backend.memory import record_session_result
+        winning_deal = res.get("deal")
+        record_session_result(
+            session_id=session_id,
+            status=res.get("status", "awaiting_approval"),
+            deal=winning_deal,
+            final_offers=res.get("final_offers", []),
+            buyer_intelligence=res.get("buyer_intelligence"),
+            order_id=res.get("order_id"),
+            approve_url=res.get("approve_url"),
+            selected_supplier=res.get("winning_vendor"),
+            total_cost=winning_deal.get("total_cost") if winning_deal else None,
+        )
+
+        # Clear in-memory session
+        with main._lock:
+            main._active_sessions.pop(session_id, None)
+
+        # Status endpoint must recover complete state from SQLite
+        resp = self.client.get(f"/api/status?session_id={session_id}")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["session_id"], session_id)
+        self.assertIsNotNone(data["deal"])
+        self.assertEqual(len(data["final_offers"]), 3)
+        self.assertIsNotNone(data["buyer_intelligence"])
+        self.assertEqual(data["winning_vendor"], res["winning_vendor"])
+
+    def test_18_supplier_reliability_score_none_when_no_history(self):
+        """18. Supplier with zero attempts returns reliability_score=None and scoring_prior=0.85."""
+        from backend.memory import get_supplier_metrics
+        new_supplier = f"BrandNewSupplier_{uuid.uuid4().hex[:6]}"
+        metrics = get_supplier_metrics(new_supplier)
+        self.assertIsNone(metrics["reliability_score"])
+        self.assertFalse(metrics["has_history"])
+        self.assertEqual(metrics["scoring_prior"], 0.85)
+
+    def test_19_strategy_metrics_returns_both_property_names_and_distinct_session_counts(self):
+        """19. Strategy effectiveness returns both avg_price_cut and avg_price_reduction with distinct session counts."""
+        from backend.memory import get_strategy_metrics, record_strategy_outcome
+        strat_name = f"TEST_STRAT_{uuid.uuid4().hex[:6]}"
+        s1 = f"sess-1-{uuid.uuid4().hex[:6]}"
+        # Record 2 rows in the same session
+        record_strategy_outcome(session_id=s1, strategy=strat_name, initial_price=100.0, final_price=90.0, won=True)
+        record_strategy_outcome(session_id=s1, strategy=strat_name, initial_price=100.0, final_price=92.0, won=False)
+
+        metrics = get_strategy_metrics()
+        strat_metric = next((m for m in metrics if m["strategy_name"] == strat_name), None)
+        self.assertIsNotNone(strat_metric)
+        # Should count as 1 session use, not 2
+        self.assertEqual(strat_metric["total_uses"], 1)
+        self.assertEqual(strat_metric["deals_closed"], 1)
+        self.assertIn("avg_price_cut", strat_metric)
+        self.assertIn("avg_price_reduction", strat_metric)
+        self.assertEqual(strat_metric["avg_price_cut"], strat_metric["avg_price_reduction"])
+
+    def test_20_paypal_validation_rejects_backend_render_url(self):
+        """20. PayPalClient raises clear PayPalError if FRONTEND_URL points to backend Render URL."""
+        from backend.paypal import PayPalClient, PayPalError
+        client = PayPalClient(
+            client_id="test_id",
+            secret="test_secret",
+            frontend_url="https://b2b-agents.onrender.com",
+        )
+        offer = CommercialOffer(
+            unit_price=50.0,
+            total_price=5000.0,
+            quantity=100,
+            delivery_days=5,
+            warranty_months=12,
+            shipping_cost=0.0,
+            payment_terms="Net 30",
+        )
+        with self.assertRaises(PayPalError) as ctx:
+            client.create_order("Test Item", 100, offer)
+        self.assertIn("FRONTEND_URL cannot point to the backend Render service", str(ctx.exception))
+
+    def test_21_paypal_pre_capture_validation_fail_closed(self):
+        """21. confirm_payment validates amount and currency before capture, rejecting mismatches."""
+        order_token = "8AB99911122233344"
+        session_id = f"test-paypal-val-{uuid.uuid4().hex[:8]}"
+        from backend.memory import record_deal_accepted
+        record_deal_accepted(
+            session_id=session_id,
+            order_id=order_token,
+            supplier_name="Sterling Quality Works",
+            amount=5000.0,
+            payment_mode="PAYPAL_SANDBOX",
+        )
+
+        with patch("main.PayPalClient.get_order_details") as mock_details:
+            # Case A: Amount mismatch ($4000 instead of $5000)
+            mock_details.return_value = {
+                "id": order_token,
+                "status": "APPROVED",
+                "purchase_units": [
+                    {"amount": {"currency_code": "USD", "value": "4000.00"}}
+                ],
+            }
+            resp = self.client.get(f"/api/confirm-payment?token={order_token}&session_id={session_id}")
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("Amount mismatch", resp.json()["detail"])
+
+            # Case B: Currency mismatch (EUR instead of USD)
+            mock_details.return_value = {
+                "id": order_token,
+                "status": "APPROVED",
+                "purchase_units": [
+                    {"amount": {"currency_code": "EUR", "value": "5000.00"}}
+                ],
+            }
+            resp2 = self.client.get(f"/api/confirm-payment?token={order_token}&session_id={session_id}")
+            self.assertEqual(resp2.status_code, 400)
+            self.assertIn("Currency mismatch", resp2.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
