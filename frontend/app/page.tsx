@@ -862,9 +862,7 @@ export default function Home() {
       } else if (tokenParam && !isCancelled) {
         setOrderId(tokenParam);
         executePaymentCaptureRef.current(tokenParam);
-      } else {
-        restoreLatestSessionRef.current();
-      }
+      } 
     }
 
     return () => {
