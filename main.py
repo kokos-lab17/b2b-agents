@@ -1,9 +1,11 @@
 """Main FastAPI application for Autonomous Multi-Agent B2B Procurement."""
 import asyncio
+import concurrent.futures
 import logging
 import re
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -87,6 +89,12 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
                 "status": s.get("status", "idle"),
                 "vendors": list(s.get("vendors", [])),
                 "deal": dict(s["deal"]) if s.get("deal") else None,
+                "final_offers": list(s.get("final_offers", [])),
+                "winning_vendor": s.get("winning_vendor"),
+                "winning_offer": dict(s["winning_offer"]) if s.get("winning_offer") else None,
+                "buyer_intelligence": dict(s["buyer_intelligence"]) if s.get("buyer_intelligence") else None,
+                "last_heartbeat": s.get("last_heartbeat"),
+                "updated_at": s.get("updated_at"),
                 "token_usage": dict(s["token_usage"]) if s.get("token_usage") else None,
                 "negotiation_mode": s.get("negotiation_mode", "DEMO"),
                 "payment_mode": s.get("payment_mode", "SIMULATED"),
@@ -105,6 +113,12 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
                 "status": db_s.get("status", "completed"),
                 "vendors": [],
                 "deal": None,
+                "final_offers": [],
+                "winning_vendor": None,
+                "winning_offer": None,
+                "buyer_intelligence": None,
+                "last_heartbeat": None,
+                "updated_at": None,
                 "token_usage": None,
                 "negotiation_mode": db_s.get("negotiation_mode", "DEMO"),
                 "payment_mode": db_s.get("payment_mode", "SIMULATED"),
@@ -119,6 +133,12 @@ def _get_session_state(session_id: str | None = None) -> dict[str, Any]:
         "status": "idle",
         "vendors": [],
         "deal": None,
+        "final_offers": [],
+        "winning_vendor": None,
+        "winning_offer": None,
+        "buyer_intelligence": None,
+        "last_heartbeat": None,
+        "updated_at": None,
         "token_usage": None,
         "negotiation_mode": "DEMO",
         "payment_mode": "SIMULATED",
@@ -137,17 +157,25 @@ def _run_procurement_worker(
     preferences: BuyerPreferences | None,
 ) -> None:
     """Background worker executing the negotiation engine for a specific session."""
+    logger.info("[%s] Stage 2: Worker started.", session_id)
+
     def on_event(evt: dict[str, Any]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
         with _lock:
             s = _active_sessions.get(session_id)
             if s:
                 s["events"].append(evt)
+                s["last_heartbeat"] = now_iso
+                s["updated_at"] = now_iso
 
     def on_vendors(vendors: list[dict[str, Any]]) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
         with _lock:
             s = _active_sessions.get(session_id)
             if s:
                 s["vendors"] = vendors
+                s["last_heartbeat"] = now_iso
+                s["updated_at"] = now_iso
 
     try:
         engine = NegotiationEngine(
@@ -163,8 +191,15 @@ def _run_procurement_worker(
             on_event=on_event,
             on_vendors=on_vendors,
         )
-        result = engine.run()
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(engine.run)
+            try:
+                result = future.result(timeout=25.0)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError("Negotiation worker timed out after 25 seconds.")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
         with _lock:
             s = _active_sessions.get(session_id)
             if s:
@@ -172,16 +207,31 @@ def _run_procurement_worker(
                 s["approve_url"] = result.get("approve_url")
                 s["status"] = result.get("status", "awaiting_approval")
                 s["deal"] = result.get("deal")
+                s["final_offers"] = result.get("final_offers", [])
+                s["winning_vendor"] = result.get("winning_vendor")
+                s["winning_offer"] = result.get("winning_offer")
+                s["buyer_intelligence"] = result.get("buyer_intelligence")
                 s["token_usage"] = result.get("token_usage")
+                s["last_heartbeat"] = now_iso
+                s["updated_at"] = now_iso
                 if result.get("vendors"):
                     s["vendors"] = result["vendors"]
 
+        logger.info(
+            "[%s] Stage 11: Worker completed successfully. Status: %s",
+            session_id,
+            s.get("status") if s else "unknown",
+        )
+
     except Exception as exc:
-        logger.exception("Procurement execution failed for session %s: %s", session_id, exc)
+        logger.error("[%s] Stage 11: Worker failed: %s", session_id, exc)
+        now_iso = datetime.now(timezone.utc).isoformat()
         with _lock:
             s = _active_sessions.get(session_id)
             if s:
                 s["status"] = "failed"
+                s["last_heartbeat"] = now_iso
+                s["updated_at"] = now_iso
                 err_evt = {
                     "step": len(s["events"]) + 1,
                     "agent": "System",
@@ -237,6 +287,17 @@ async def start(body: StartRequest):
     if pay_mode is None:
         pay_mode = PaymentMode.SIMULATED if body.demo_mode else PaymentMode.PAYPAL_SANDBOX
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+    logger.info(
+        "[%s] Stage 1: Procurement request accepted. Product='%s', Qty=%d, Budget=$%.2f. Mode: %s/%s",
+        session_id,
+        body.product,
+        body.qty,
+        body.budget,
+        neg_mode.value,
+        pay_mode.value,
+    )
+
     with _lock:
         _active_sessions[session_id] = {
             "session_id": session_id,
@@ -246,10 +307,16 @@ async def start(body: StartRequest):
             "status": "negotiating",
             "vendors": [],
             "deal": None,
+            "final_offers": [],
+            "winning_vendor": None,
+            "winning_offer": None,
+            "buyer_intelligence": None,
             "token_usage": None,
             "negotiation_mode": neg_mode.value,
             "payment_mode": pay_mode.value,
             "buyer_id": body.buyer_id,
+            "last_heartbeat": now_iso,
+            "updated_at": now_iso,
         }
         _latest_session_id = session_id
 
@@ -271,6 +338,7 @@ async def start(body: StartRequest):
     thread.start()
 
     return {"status": "started", "session_id": session_id}
+
 
 
 @app.get("/api/status")

@@ -233,6 +233,12 @@ class StatusResponse(BaseModel):
     payment_mode: str = "SIMULATED"
     vendors: list[dict[str, Any]] = Field(default_factory=list)
     deal: dict[str, Any] | None = None
+    final_offers: list[dict[str, Any]] = Field(default_factory=list)
+    winning_vendor: str | None = None
+    winning_offer: dict[str, Any] | None = None
+    buyer_intelligence: dict[str, Any] | None = None
+    last_heartbeat: str | None = None
+    updated_at: str | None = None
     token_usage: dict[str, Any] | None = None
     audit_trail: list[dict[str, Any]] = Field(default_factory=list)
 

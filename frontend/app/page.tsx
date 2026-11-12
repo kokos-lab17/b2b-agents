@@ -58,6 +58,49 @@ type Vendor = {
   reliability_score?: number;
 };
 
+type FinalOffer = {
+  vendor: string;
+  archetype?: string;
+  style?: string;
+  specialty?: string;
+  key?: string;
+  unit_price: number;
+  total_price: number;
+  quantity?: number;
+  delivery_days: number;
+  warranty_months: number;
+  shipping_cost: number;
+  payment_terms: string;
+  special_concessions?: string[];
+  commercial_score: number;
+  score_breakdown?: ScoreBreakdown;
+  is_winner: boolean;
+  is_disqualified?: boolean;
+  violations?: string[];
+  initial_unit_price?: number;
+  price_reduction?: number;
+  price_reduction_pct?: number;
+};
+
+type BuyerIntelligence = {
+  recommended_supplier: string;
+  recommended_reason: string;
+  final_deal_total: number;
+  unit_price: number;
+  budget_cap: number;
+  budget_total: number;
+  budget_utilization_pct: number;
+  budget_headroom: number;
+  budget_headroom_unit: number;
+  negotiated_savings: number;
+  negotiated_savings_unit: number;
+  initial_offered_price?: number;
+  price_reduction_pct?: number;
+  trade_offs?: string;
+  reliability_notes?: string;
+  strategy_pivot_reasoning?: string;
+};
+
 type StatusResponse = {
   session_id?: string | null;
   events?: EventRow[] | null;
@@ -66,6 +109,11 @@ type StatusResponse = {
   status?: string | null;
   vendors?: Vendor[] | null;
   deal?: Deal | null;
+  final_offers?: FinalOffer[] | null;
+  winning_vendor?: string | null;
+  buyer_intelligence?: BuyerIntelligence | null;
+  last_heartbeat?: string | null;
+  updated_at?: string | null;
   negotiation_mode?: string | null;
   payment_mode?: string | null;
 };
@@ -262,8 +310,8 @@ function removeStoredOrderId(): void {
 
 const BUTTON_LABELS: Record<Phase, string> = {
   idle: 'Start Autonomous Procurement',
-  running: 'Negotiating in Progress…',
-  awaiting_approval: 'Review & Settle Deal',
+  running: 'Negotiating with Suppliers…',
+  awaiting_approval: 'Start New Procurement',
   completed: 'Start New Procurement',
   failed: 'Restart Procurement',
   no_agreement: 'Restart Procurement',
@@ -301,6 +349,8 @@ export default function Home() {
   const [rowData, setRowData] = useState<EventRow[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [deal, setDeal] = useState<Deal | null>(null);
+  const [finalOffers, setFinalOffers] = useState<FinalOffer[]>([]);
+  const [buyerIntelligence, setBuyerIntelligence] = useState<BuyerIntelligence | null>(null);
   const [orderId, setOrderId] = useState<string | null>(null);
   const [approveUrl, setApproveUrl] = useState<string | null>(null);
   const [captured, setCaptured] = useState(false);
@@ -516,6 +566,8 @@ export default function Home() {
     }
   };
 
+  const activeSessionIdRef = useRef<string | null>(null);
+
   const applyStatusResponse = useCallback(
     (data: StatusResponse) => {
       const events = Array.isArray(data.events) ? data.events : [];
@@ -531,10 +583,19 @@ export default function Home() {
       setRowData(mapped);
       setVendors(Array.isArray(data.vendors) ? data.vendors : []);
       if (data.deal) setDeal(data.deal);
+      if (Array.isArray(data.final_offers) && data.final_offers.length > 0) {
+        setFinalOffers(data.final_offers);
+      }
+      if (data.buyer_intelligence) {
+        setBuyerIntelligence(data.buyer_intelligence);
+      }
       setBackendStatus(data.status || '');
       if (data.order_id) setOrderId(data.order_id);
       setApproveUrl(data.approve_url || null);
-      if (data.session_id) setCurrentSessionId(data.session_id);
+      if (data.session_id) {
+        activeSessionIdRef.current = data.session_id;
+        setCurrentSessionId(data.session_id);
+      }
 
       const backendPhase = mapBackendStatus(data.status);
       if (backendPhase === 'awaiting_approval') {
@@ -565,15 +626,16 @@ export default function Home() {
     [stopPolling]
   );
 
-  const pollStatus = useCallback(async () => {
+  const pollStatus = useCallback(async (targetSid?: string) => {
     if (pollInFlightRef.current) return;
     pollInFlightRef.current = true;
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       try {
-        const url = currentSessionId
-          ? `${BACKEND_URL}/api/status?session_id=${encodeURIComponent(currentSessionId)}`
+        const sid = targetSid || activeSessionIdRef.current || currentSessionId;
+        const url = sid
+          ? `${BACKEND_URL}/api/status?session_id=${encodeURIComponent(sid)}`
           : `${BACKEND_URL}/api/status`;
         const res = await fetch(url, {
           cache: 'no-store',
@@ -694,10 +756,16 @@ export default function Home() {
     }
   }, [activeTab, currentSessionId, fetchAnalytics, fetchAuditTrail]);
 
-  const startPolling = useCallback(() => {
+  const startPolling = useCallback((sessionId?: string) => {
     stopPolling();
-    pollStatus();
-    pollRef.current = setInterval(pollStatus, 2000);
+    if (sessionId) {
+      activeSessionIdRef.current = sessionId;
+    }
+    const sid = sessionId || activeSessionIdRef.current;
+    pollStatus(sid || undefined);
+    pollRef.current = setInterval(() => {
+      pollStatus(activeSessionIdRef.current || undefined);
+    }, 2000);
   }, [pollStatus, stopPolling]);
 
   const validateForm = (): string[] => {
@@ -776,16 +844,21 @@ export default function Home() {
       return;
     }
 
+    if (newSessionId) {
+      activeSessionIdRef.current = newSessionId;
+    }
     setCurrentSessionId(newSessionId);
     setCaptured(false);
     setRowData([]);
     setVendors([]);
     setDeal(null);
+    setFinalOffers([]);
+    setBuyerIntelligence(null);
     setOrderId(null);
     setApproveUrl(null);
     confirmingRef.current = false;
     setPhase('running');
-    startPolling();
+    startPolling(newSessionId || undefined);
   };
 
   const openApprove = (url: string) => {
@@ -797,7 +870,7 @@ export default function Home() {
   };
 
   const running = phase === 'running';
-  const canSubmit = !running && phase !== 'awaiting_approval';
+  const canSubmit = !running;
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl bg-gray-950 px-4 py-8 text-white sm:px-8">
@@ -1113,7 +1186,7 @@ export default function Home() {
                   disabled={!canSubmit}
                   className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {(running || phase === 'awaiting_approval') && (
+                  {running && (
                     <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
@@ -1191,106 +1264,356 @@ export default function Home() {
             </div>
           )}
 
-          {/* Deal Winner & Commercial Scoring Breakdown Card */}
-          {deal && (
-            <section className="mt-6 rounded-xl border border-cyan-500/40 bg-cyan-950/20 p-5 shadow-lg">
-              <div className="flex flex-col justify-between gap-2 border-b border-cyan-800/40 pb-3 sm:flex-row sm:items-center">
+          {/* Journey Step B: Real-time Explainable AG Grid Feed */}
+          <section className="mt-6">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="rounded bg-blue-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-400">
+                  Journey Step B
+                </span>
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-300">
+                  Explainable Multi-Agent Negotiation Activity Stream
+                </h2>
+              </div>
+              <span className="text-xs text-gray-500">Autonomous adaptive turn protocol</span>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-gray-800 shadow-md">
+              <div
+                className="ag-theme-alpine-dark"
+                style={{ height: 420, width: '100%', minWidth: 920 }}
+              >
+                <AgGridReact
+                  rowData={rowData}
+                  columnDefs={columnDefs}
+                  defaultColDef={{ sortable: false, filter: false, resizable: true }}
+                  getRowId={(params) => String(params.data.step ?? params.data.agent)}
+                  theme="legacy"
+                  headerHeight={44}
+                  suppressCellFocus={true}
+                />
+              </div>
+            </div>
+          </section>
+
+          {/* Journey Step C: Automatic 3-Supplier Comparison Table */}
+          {(finalOffers.length > 0 || deal) && (
+            <section className="mt-6 rounded-xl border border-gray-800 bg-gray-900/70 p-5 shadow-xl">
+              <div className="mb-4 flex flex-col justify-between gap-2 border-b border-gray-800 pb-3 sm:flex-row sm:items-center">
                 <div>
-                  <span className="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
-                    Selected Commercial Winner
-                  </span>
-                  <h2 className="mt-1 text-xl font-bold text-white">{deal.selected_vendor}</h2>
-                </div>
-                <div className="text-right">
-                  <span className="text-xs text-gray-400">Commercial Evaluation Score</span>
-                  <div className="text-2xl font-black text-cyan-300">
-                    {deal.commercial_score.toFixed(1)} <span className="text-sm font-normal text-gray-400">/ 100</span>
+                  <div className="flex items-center gap-2">
+                    <span className="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                      Journey Step C
+                    </span>
+                    <h2 className="text-lg font-bold text-white">Side-by-Side Supplier Offer Comparison</h2>
                   </div>
+                  <p className="mt-1 text-xs text-gray-400">
+                    Transparent final commercial terms from all 3 independent supplier personas evaluated by deterministic scoring.
+                  </p>
                 </div>
+                {deal && (
+                  <div className="text-xs font-semibold text-cyan-300">
+                    Selected Winner: <span className="text-white underline">{deal.selected_vendor}</span>
+                  </div>
+                )}
               </div>
 
-              {/* Negotiated Terms */}
-              {deal.terms && (
-                <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-6 text-xs">
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Unit Price</span>
-                    <p className="mt-1 text-base font-bold text-emerald-400">${deal.terms.unit_price.toFixed(2)}</p>
-                  </div>
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Total Order</span>
-                    <p className="mt-1 text-base font-bold text-white">${deal.terms.total_price.toFixed(2)}</p>
-                  </div>
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Lead Time</span>
-                    <p className="mt-1 text-base font-bold text-white">{deal.terms.delivery_days} Days</p>
-                  </div>
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Warranty</span>
-                    <p className="mt-1 text-base font-bold text-purple-300">{deal.terms.warranty_months} Mos</p>
-                  </div>
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Freight</span>
-                    <p className="mt-1 text-base font-bold text-white">
-                      {deal.terms.shipping_cost <= 0 ? 'FREE ($0)' : `$${deal.terms.shipping_cost.toFixed(2)}`}
-                    </p>
-                  </div>
-                  <div className="rounded-lg border border-gray-800 bg-gray-900/80 p-2.5">
-                    <span className="text-gray-400">Payment Terms</span>
-                    <p className="mt-1 text-base font-bold text-blue-300">{deal.terms.payment_terms}</p>
-                  </div>
-                </div>
-              )}
+              {/* 3-Column Supplier Cards */}
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                {(finalOffers.length > 0
+                  ? finalOffers
+                  : deal
+                  ? [
+                      {
+                        vendor: deal.selected_vendor,
+                        archetype: deal.selected_vendor.includes('Apex')
+                          ? 'Hard Bargainer'
+                          : deal.selected_vendor.includes('Sterling')
+                          ? 'Value Defender'
+                          : 'Strategic Flexible Negotiator',
+                        unit_price: deal.terms.unit_price,
+                        total_price: deal.terms.total_price,
+                        delivery_days: deal.terms.delivery_days,
+                        warranty_months: deal.terms.warranty_months,
+                        shipping_cost: deal.terms.shipping_cost,
+                        payment_terms: deal.terms.payment_terms,
+                        special_concessions: deal.terms.special_concessions || [],
+                        commercial_score: deal.commercial_score,
+                        score_breakdown: deal.score_breakdown,
+                        is_winner: true,
+                      },
+                    ]
+                  : []
+                ).map((offer) => {
+                  const isWinner = offer.is_winner || offer.vendor === deal?.selected_vendor;
+                  return (
+                    <div
+                      key={offer.vendor}
+                      className={`flex flex-col justify-between rounded-xl border p-4.5 transition-all shadow-md ${
+                        isWinner
+                          ? 'border-cyan-500/60 bg-cyan-950/25 ring-1 ring-cyan-500/30'
+                          : 'border-gray-800 bg-gray-950/70'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-sm font-bold text-white">{offer.vendor}</span>
+                              {isWinner && (
+                                <span className="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                                  ★ Winner
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-gray-400 font-medium">
+                              {offer.archetype ||
+                                (offer.vendor.includes('Apex')
+                                  ? 'Hard Bargainer'
+                                  : offer.vendor.includes('Sterling')
+                                  ? 'Value Defender'
+                                  : 'Strategic Flexible Negotiator')}
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-[10px] uppercase tracking-wider text-gray-400">Score</span>
+                            <div className={`text-xl font-black ${isWinner ? 'text-cyan-300' : 'text-gray-300'}`}>
+                              {offer.commercial_score
+                                ? offer.commercial_score.toFixed(1)
+                                : isWinner && deal?.commercial_score
+                                ? deal.commercial_score.toFixed(1)
+                                : '—'}
+                              <span className="text-xs font-normal text-gray-500">/100</span>
+                            </div>
+                          </div>
+                        </div>
 
-              {/* Score Factor Breakdown */}
-              {deal.score_breakdown && (
-                <div className="mt-4 border-t border-gray-800/80 pt-3">
-                  <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
-                    Deterministic Commercial Scoring Breakdown
-                  </div>
-                  <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-6">
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Price Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.price_score}</div>
+                        {/* Offer Details Grid */}
+                        <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Final Unit Price</span>
+                            <div className="mt-0.5 font-bold text-emerald-400 text-sm">
+                              ${offer.unit_price.toFixed(2)}
+                            </div>
+                            {offer.initial_unit_price && offer.initial_unit_price > offer.unit_price && (
+                              <div className="text-[10px] text-emerald-500/80">
+                                ↓ ${offer.price_reduction?.toFixed(2)} (-{offer.price_reduction_pct?.toFixed(1)}%)
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Total Order</span>
+                            <div className="mt-0.5 font-bold text-white text-sm">
+                              ${offer.total_price.toFixed(2)}
+                            </div>
+                            <div className="text-[10px] text-gray-500">
+                              for {qty || 500} units
+                            </div>
+                          </div>
+
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Lead Time</span>
+                            <div className="mt-0.5 font-bold text-white text-sm">
+                              {offer.delivery_days} Days
+                            </div>
+                          </div>
+
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Warranty</span>
+                            <div className="mt-0.5 font-bold text-purple-300 text-sm">
+                              {offer.warranty_months} Mos
+                            </div>
+                          </div>
+
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Freight</span>
+                            <div className="mt-0.5 font-bold text-white text-sm">
+                              {offer.shipping_cost <= 0 ? 'FREE ($0)' : `$${offer.shipping_cost.toFixed(2)}`}
+                            </div>
+                          </div>
+
+                          <div className="rounded bg-gray-900/80 p-2 border border-gray-800/80">
+                            <span className="text-gray-400 text-[11px]">Payment Terms</span>
+                            <div className="mt-0.5 font-bold text-blue-300 text-sm">
+                              {offer.payment_terms}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Concessions */}
+                        {offer.special_concessions && offer.special_concessions.length > 0 && (
+                          <div className="mt-2.5 flex flex-wrap gap-1">
+                            {offer.special_concessions.map((c, i) => (
+                              <span
+                                key={i}
+                                className="rounded bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 text-[10px] text-purple-300"
+                              >
+                                ✓ {c}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Score Rationale Footer */}
+                      {isWinner && deal?.score_breakdown?.explanation && (
+                        <div className="mt-3 border-t border-cyan-800/40 pt-2 text-[11px] text-cyan-200/90 italic">
+                          “{deal.score_breakdown.explanation}”
+                        </div>
+                      )}
                     </div>
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Delivery Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.delivery_score}</div>
-                    </div>
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Warranty Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.warranty_score}</div>
-                    </div>
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Shipping Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.shipping_score}</div>
-                    </div>
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Terms Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.terms_score}</div>
-                    </div>
-                    <div className="rounded bg-gray-900/60 p-2">
-                      <span className="text-gray-400">Reliability Score</span>
-                      <div className="font-semibold text-white">{deal.score_breakdown.reliability_score}</div>
-                    </div>
-                  </div>
-                  <p className="mt-2 text-xs text-gray-300 italic">{deal.score_breakdown.explanation}</p>
-                </div>
-              )}
+                  );
+                })}
+              </div>
             </section>
           )}
 
-          {/* Smart Approval & Settlement Card (Features 3 & 11) */}
+          {/* Journey Step D: Buyer Intelligence Summary */}
+          {(buyerIntelligence || deal) && (
+            <section className="mt-6 rounded-xl border border-indigo-500/30 bg-indigo-950/20 p-5 shadow-xl">
+              {(() => {
+                const bi = buyerIntelligence || {
+                  recommended_supplier: deal!.selected_vendor,
+                  recommended_reason:
+                    deal!.score_breakdown?.explanation || 'Selected by multi-factor deterministic scoring.',
+                  final_deal_total: deal!.terms.total_price,
+                  unit_price: deal!.terms.unit_price,
+                  budget_cap: Number(budget) || 90.0,
+                  budget_total: (Number(budget) || 90.0) * (deal!.terms.quantity || Number(qty) || 500),
+                  budget_utilization_pct:
+                    Number(budget) > 0 ? (deal!.terms.unit_price / Number(budget)) * 100 : 100,
+                  budget_headroom: Math.max(
+                    0,
+                    (Number(budget) || 90.0) * (deal!.terms.quantity || Number(qty) || 500) -
+                      deal!.terms.total_price
+                  ),
+                  budget_headroom_unit: Math.max(0, (Number(budget) || 90.0) - deal!.terms.unit_price),
+                  negotiated_savings: 0.0,
+                  negotiated_savings_unit: 0.0,
+                  trade_offs: 'Lead time, warranty, and freight terms balanced across supplier bids.',
+                  reliability_notes: 'Supplier performance verified in SQLite persistent memory.',
+                  strategy_pivot_reasoning: 'Autonomous buyer evaluated supplier offers and adapted commercial proposals.',
+                };
+
+                return (
+                  <>
+                    <div className="mb-4 flex flex-col justify-between gap-2 border-b border-indigo-800/40 pb-3 sm:flex-row sm:items-center">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="rounded bg-indigo-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                            Journey Step D
+                          </span>
+                          <h2 className="text-lg font-bold text-white">Commercial Buyer Intelligence & Decision Summary</h2>
+                        </div>
+                        <p className="mt-1 text-xs text-gray-300">
+                          Executive financial breakdown clearly distinguishing unspent budget headroom from negotiated price cuts.
+                        </p>
+                      </div>
+                      <div className="rounded bg-indigo-500/20 px-3 py-1 text-xs font-semibold text-indigo-300">
+                        Recommended Supplier: <strong className="text-white">{bi.recommended_supplier}</strong>
+                      </div>
+                    </div>
+
+                    {/* 4 Financial Metric Cards */}
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      <div className="rounded-lg border border-gray-800 bg-gray-900/90 p-3">
+                        <span className="text-[11px] uppercase tracking-wider text-gray-400">Final Deal Total</span>
+                        <div className="mt-1 text-xl font-extrabold text-white">
+                          ${bi.final_deal_total.toFixed(2)}
+                        </div>
+                        <div className="text-[11px] text-gray-400">
+                          ${bi.unit_price.toFixed(2)} / unit
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-gray-800 bg-gray-900/90 p-3">
+                        <span className="text-[11px] uppercase tracking-wider text-gray-400">Budget Utilization</span>
+                        <div className="mt-1 text-xl font-extrabold text-blue-400">
+                          {bi.budget_utilization_pct.toFixed(1)}%
+                        </div>
+                        <div className="text-[11px] text-gray-400">
+                          Budget Cap: ${bi.budget_total.toFixed(2)}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/20 p-3">
+                        <span className="text-[11px] uppercase tracking-wider text-emerald-400">Budget Headroom</span>
+                        <div className="mt-1 text-xl font-extrabold text-emerald-400">
+                          ${bi.budget_headroom.toFixed(2)}
+                        </div>
+                        <div className="text-[11px] text-emerald-300/80">
+                          Unspent budget (${bi.budget_headroom_unit.toFixed(2)}/u)
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-purple-500/30 bg-purple-950/20 p-3">
+                        <span className="text-[11px] uppercase tracking-wider text-purple-400">Negotiated Savings</span>
+                        <div className="mt-1 text-xl font-extrabold text-purple-300">
+                          ${bi.negotiated_savings.toFixed(2)}
+                        </div>
+                        <div className="text-[11px] text-purple-300/80">
+                          Cut vs opening quote (${bi.negotiated_savings_unit.toFixed(2)}/u)
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Analytical Explanations */}
+                    <div className="mt-4 space-y-3 rounded-lg border border-gray-800/80 bg-gray-950/60 p-4 text-xs">
+                      <div>
+                        <span className="font-semibold text-gray-300 uppercase text-[10px] tracking-wider">
+                          Commercial Selection Rationale:
+                        </span>
+                        <p className="mt-0.5 text-gray-200">{bi.recommended_reason}</p>
+                      </div>
+
+                      {bi.strategy_pivot_reasoning && (
+                        <div>
+                          <span className="font-semibold text-gray-300 uppercase text-[10px] tracking-wider">
+                            Autonomous Strategy Adaptation Rationale:
+                          </span>
+                          <p className="mt-0.5 text-gray-200">{bi.strategy_pivot_reasoning}</p>
+                        </div>
+                      )}
+
+                      {bi.trade_offs && (
+                        <div>
+                          <span className="font-semibold text-gray-300 uppercase text-[10px] tracking-wider">
+                            Supplier Trade-offs Analysis:
+                          </span>
+                          <p className="mt-0.5 text-gray-300">{bi.trade_offs}</p>
+                        </div>
+                      )}
+
+                      {bi.reliability_notes && (
+                        <div>
+                          <span className="font-semibold text-gray-300 uppercase text-[10px] tracking-wider">
+                            Historical Reliability Notes:
+                          </span>
+                          <p className="mt-0.5 text-gray-300">{bi.reliability_notes}</p>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                );
+              })()}
+            </section>
+          )}
+
+          {/* Journey Step E: Smart Approval & Settlement Card */}
           {phase === 'awaiting_approval' && (
             <section className="mt-6">
               {paymentMode === 'SIMULATED' ? (
                 <div className="rounded-xl border border-teal-500/40 bg-teal-950/20 p-5 shadow-lg">
                   <div className="flex items-center gap-2">
                     <span className="h-2.5 w-2.5 rounded-full bg-teal-400 animate-pulse"></span>
-                    <h3 className="text-base font-bold text-teal-300">Simulated Deal Settlement Confirmation</h3>
+                    <h3 className="text-base font-bold text-teal-300">
+                      Journey Step E: Simulated Deal Settlement Confirmation
+                    </h3>
                   </div>
                   <p className="mt-2 text-xs text-gray-300">
                     Negotiation finalized. Deal locked with <strong className="text-white">{deal?.selected_vendor}</strong>.
-                    Simulated Order ID: <span className="font-mono text-white">{orderId}</span>
+                    Simulated Order ID: <span className="font-mono text-white">{orderId}</span>.
+                    Zero external payment calls required.
                   </p>
                   <div className="mt-4">
                     <button
@@ -1307,7 +1630,9 @@ export default function Home() {
                   <div className="rounded-xl border border-yellow-400/40 bg-yellow-400/5 p-5 shadow-lg">
                     <div className="flex items-center gap-2">
                       <span className="h-2.5 w-2.5 rounded-full bg-yellow-400 animate-pulse"></span>
-                      <h3 className="text-base font-bold text-yellow-300">PayPal Sandbox Human Authorization Required</h3>
+                      <h3 className="text-base font-bold text-yellow-300">
+                        Journey Step E: PayPal Sandbox Human Authorization Required
+                      </h3>
                     </div>
                     {orderId && (
                       <p className="mt-2 text-xs text-gray-300">
@@ -1331,32 +1656,6 @@ export default function Home() {
               )}
             </section>
           )}
-
-          {/* Real-time Explainable AG Grid Feed */}
-          <section className="mt-6">
-            <div className="mb-2 flex items-center justify-between">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400">
-                Explainable Multi-Agent Negotiation Stream
-              </h2>
-              <span className="text-xs text-gray-500">Autonomous adaptive turn protocol</span>
-            </div>
-            <div className="overflow-x-auto rounded-xl border border-gray-800 shadow-md">
-              <div
-                className="ag-theme-alpine-dark"
-                style={{ height: 500, width: '100%', minWidth: 920 }}
-              >
-                <AgGridReact
-                  rowData={rowData}
-                  columnDefs={columnDefs}
-                  defaultColDef={{ sortable: false, filter: false, resizable: true }}
-                  getRowId={(params) => String(params.data.step ?? params.data.agent)}
-                  theme="legacy"
-                  headerHeight={44}
-                  suppressCellFocus={true}
-                />
-              </div>
-            </div>
-          </section>
 
           {/* Supplier Personas & Memory */}
           {vendors.length > 0 && (

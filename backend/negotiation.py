@@ -190,6 +190,16 @@ class NegotiationEngine:
             priority_type=(self.preferences.priority_type.value if self.preferences else None),
         )
 
+        logger.info(
+            "[%s] Stage 3: Negotiation engine initialized for product='%s', qty=%d, budget=$%.2f. Mode: %s/%s",
+            self.session_id,
+            self.product,
+            self.qty,
+            self.budget,
+            self.negotiation_mode.value,
+            self.payment_mode.value,
+        )
+
         # 1. Announce Vendors & History
         public_vendors = []
         for key, info in self.sellers_info.items():
@@ -266,6 +276,7 @@ class NegotiationEngine:
         )
 
         # 3. Round 1: Solicit Initial Offers from the 3 Independent Sellers
+        logger.info("[%s] Stage 4: Round 1 started. Requesting opening terms from 3 sellers.", self.session_id)
         round1_offers: dict[str, CommercialOffer] = {}
         for key, p in self.sellers_info.items():
             offer = self._seller_round1_decision(key, target_discount_unit)
@@ -294,11 +305,18 @@ class NegotiationEngine:
                 final_unit_price=validated_offer.unit_price,
                 final_total_price=validated_offer.total_price,
             )
+        logger.info("[%s] Stage 4: Round 1 completed. Received opening offers from all 3 sellers.", self.session_id)
 
         # 4. Genuinely Autonomous Buyer Evaluation & Concrete Proposals
         buyer_decision = self._buyer_evaluate_and_decide(round1_offers)
         current_strategy = buyer_decision["chosen_strategy"]
         proposals_by_seller = buyer_decision["proposals"]
+        logger.info(
+            "[%s] Stage 5: Buyer strategy selected: '%s'. Rationale: %s",
+            self.session_id,
+            current_strategy,
+            buyer_decision["strategy_reasoning"],
+        )
 
         record_audit_event(
             session_id=self.session_id,
@@ -320,6 +338,7 @@ class NegotiationEngine:
         )
 
         # 5. Round 2: Sellers Evaluate Buyer's Concrete Structured Proposals
+        logger.info("[%s] Stage 6: Round 2 started. Presenting structured proposals to sellers.", self.session_id)
         final_offers: dict[str, CommercialOffer] = {}
         for key, p in self.sellers_info.items():
             r1 = round1_offers[key]
@@ -352,6 +371,7 @@ class NegotiationEngine:
                 final_unit_price=validated_r2.unit_price,
                 final_total_price=validated_r2.total_price,
             )
+        logger.info("[%s] Stage 6: Round 2 completed. Received final counteroffers from all 3 sellers.", self.session_id)
 
         # 6. Deterministic Multi-Factor Commercial Scoring with Constraints
         scored_candidates: list[dict[str, Any]] = []
@@ -375,6 +395,7 @@ class NegotiationEngine:
                     "violations": breakdown.constraint_violations,
                 }
             )
+        logger.info("[%s] Stage 7: Commercial scoring completed across all 5 dimensions.", self.session_id)
 
         # Honor hard constraints: prioritize qualified candidates
         qualified_candidates = [c for c in scored_candidates if not c["is_disqualified"]]
@@ -385,6 +406,12 @@ class NegotiationEngine:
         winning_name = winner["name"]
         winning_offer: CommercialOffer = winner["offer"]
         winning_breakdown: CommercialScoreBreakdown = winner["score_breakdown"]
+        logger.info(
+            "[%s] Stage 8: Winning supplier selected: '%s' with commercial score %.1f/100.",
+            self.session_id,
+            winning_name,
+            winning_breakdown.total_score,
+        )
 
         # Record strategy outcomes for procurement intelligence
         for c in scored_candidates:
@@ -397,6 +424,81 @@ class NegotiationEngine:
                 final_price=c["offer"].unit_price,
                 won=is_winner,
             )
+
+        # Build 3-Supplier Comparison Summary
+        final_offers_summary: list[dict[str, Any]] = []
+        for key, offer in final_offers.items():
+            p = self.sellers_info[key]
+            cand = next((c for c in scored_candidates if c["key"] == key), None)
+            r1_unit = round1_offers[key].unit_price
+            fin_unit = offer.unit_price
+            price_cut = round(r1_unit - fin_unit, 2)
+            price_cut_pct = round((price_cut / r1_unit) * 100, 1) if r1_unit > 0 else 0.0
+            final_offers_summary.append({
+                "vendor": p["name"],
+                "archetype": p["archetype"],
+                "style": p["style"],
+                "specialty": p["specialty"],
+                "key": key,
+                "unit_price": offer.unit_price,
+                "total_price": offer.total_price,
+                "quantity": offer.quantity,
+                "delivery_days": offer.delivery_days,
+                "warranty_months": offer.warranty_months,
+                "shipping_cost": offer.shipping_cost,
+                "payment_terms": offer.payment_terms,
+                "special_concessions": list(offer.special_concessions or []),
+                "commercial_score": cand["total_score"] if cand else 0.0,
+                "score_breakdown": cand["score_breakdown"].model_dump() if cand else {},
+                "is_winner": (key == winner["key"]),
+                "is_disqualified": cand["is_disqualified"] if cand else False,
+                "violations": cand["violations"] if cand else [],
+                "initial_unit_price": r1_unit,
+                "price_reduction": price_cut,
+                "price_reduction_pct": price_cut_pct,
+            })
+
+        # Build Buyer Intelligence Summary
+        budget_total = round(self.budget * self.qty, 2)
+        final_deal_total = winning_offer.total_price
+        budget_headroom = round(budget_total - final_deal_total, 2)
+        budget_headroom_unit = round(self.budget - winning_offer.unit_price, 2)
+        win_r1_price = round1_offers[winner["key"]].unit_price
+        negotiated_savings = round((win_r1_price - winning_offer.unit_price) * self.qty, 2)
+        negotiated_savings_unit = round(win_r1_price - winning_offer.unit_price, 2)
+        budget_utilization_pct = round((final_deal_total / budget_total) * 100, 1) if budget_total > 0 else 100.0
+
+        trade_offs = []
+        for fo in final_offers_summary:
+            trade_offs.append(
+                f"{fo['vendor']}: ${fo['unit_price']:.2f}/unit ({fo['delivery_days']}d lead, {fo['warranty_months']}mo warranty, freight ${fo['shipping_cost']:.2f})"
+            )
+        trade_offs_summary = " | ".join(trade_offs)
+
+        win_metrics = get_supplier_metrics(winning_name)
+        reliability_notes = (
+            f"{winning_name}: Reliability score {win_metrics['reliability_score']}/100 "
+            f"({win_metrics['captured_payments']} settled out of {win_metrics['attempted_deals']} negotiations)."
+        )
+
+        buyer_intelligence = {
+            "recommended_supplier": winning_name,
+            "recommended_reason": winning_breakdown.explanation,
+            "final_deal_total": final_deal_total,
+            "unit_price": winning_offer.unit_price,
+            "budget_cap": self.budget,
+            "budget_total": budget_total,
+            "budget_utilization_pct": budget_utilization_pct,
+            "budget_headroom": budget_headroom,
+            "budget_headroom_unit": budget_headroom_unit,
+            "negotiated_savings": negotiated_savings,
+            "negotiated_savings_unit": negotiated_savings_unit,
+            "initial_offered_price": win_r1_price,
+            "price_reduction_pct": round((negotiated_savings_unit / win_r1_price) * 100, 1) if win_r1_price > 0 else 0.0,
+            "trade_offs": trade_offs_summary,
+            "reliability_notes": reliability_notes,
+            "strategy_pivot_reasoning": buyer_decision["strategy_reasoning"],
+        }
 
         record_audit_event(
             session_id=self.session_id,
@@ -443,6 +545,7 @@ class NegotiationEngine:
                 amount=winning_offer.total_price,
                 payment_mode="SIMULATED",
             )
+            logger.info("[%s] Stage 9: Deal recorded in persistent memory. Order ID: %s", self.session_id, order_id)
             self._emit(
                 agent="System",
                 message=(
@@ -455,6 +558,24 @@ class NegotiationEngine:
                 offer=winning_offer.unit_price,
                 details={"order_id": order_id, "payment_mode": "SIMULATED"},
             )
+            self._emit(
+                agent="System",
+                message=(
+                    f"PROCUREMENT COMPLETED: Deal finalized with {winning_name}. "
+                    f"Budget Headroom: ${budget_headroom:.2f} (Utilization: {budget_utilization_pct:.1f}%). "
+                    f"Actual Negotiated Price Cut: ${negotiated_savings:.2f} vs opening quote."
+                ),
+                status="awaiting_approval",
+                event_type="procurement_completed",
+                offer=winning_offer.unit_price,
+                details={
+                    "order_id": order_id,
+                    "winner": winning_name,
+                    "budget_headroom": budget_headroom,
+                    "negotiated_savings": negotiated_savings,
+                },
+            )
+            logger.info("[%s] Stage 10: Payment preparation completed (SIMULATED). Ready for instant settlement.", self.session_id)
             record_session(
                 session_id=self.session_id,
                 product=self.product,
@@ -481,6 +602,10 @@ class NegotiationEngine:
                     "score_breakdown": winning_breakdown.model_dump(),
                     "terms": winning_offer.model_dump(),
                 },
+                "final_offers": final_offers_summary,
+                "winning_vendor": winning_name,
+                "winning_offer": winning_offer.model_dump(),
+                "buyer_intelligence": buyer_intelligence,
                 "events": self.events,
                 "token_usage": (
                     self.groq_client.get_usage_metadata(is_demo=self.demo_mode).model_dump()
@@ -503,6 +628,7 @@ class NegotiationEngine:
                 amount=winning_offer.total_price,
                 payment_mode="PAYPAL_SANDBOX",
             )
+            logger.info("[%s] Stage 9: Deal recorded in persistent memory. PayPal Order ID: %s", self.session_id, order_id)
             self._emit(
                 agent="System",
                 message=(
@@ -515,6 +641,25 @@ class NegotiationEngine:
                 offer=winning_offer.unit_price,
                 details={"order_id": order_id, "payment_mode": "PAYPAL_SANDBOX", "approve_url": approve_url},
             )
+            self._emit(
+                agent="System",
+                message=(
+                    f"PROCUREMENT COMPLETED: Deal finalized with {winning_name}. "
+                    f"Budget Headroom: ${budget_headroom:.2f} (Utilization: {budget_utilization_pct:.1f}%). "
+                    f"Actual Negotiated Price Cut: ${negotiated_savings:.2f} vs opening quote."
+                ),
+                status="awaiting_approval",
+                event_type="procurement_completed",
+                offer=winning_offer.unit_price,
+                details={
+                    "order_id": order_id,
+                    "winner": winning_name,
+                    "budget_headroom": budget_headroom,
+                    "negotiated_savings": negotiated_savings,
+                    "approve_url": approve_url,
+                },
+            )
+            logger.info("[%s] Stage 10: Payment preparation completed (PAYPAL_SANDBOX). Approval URL ready.", self.session_id)
             record_session(
                 session_id=self.session_id,
                 product=self.product,
@@ -541,6 +686,10 @@ class NegotiationEngine:
                     "score_breakdown": winning_breakdown.model_dump(),
                     "terms": winning_offer.model_dump(),
                 },
+                "final_offers": final_offers_summary,
+                "winning_vendor": winning_name,
+                "winning_offer": winning_offer.model_dump(),
+                "buyer_intelligence": buyer_intelligence,
                 "events": self.events,
                 "token_usage": (
                     self.groq_client.get_usage_metadata(is_demo=False).model_dump()
@@ -577,7 +726,16 @@ class NegotiationEngine:
                 "negotiation_mode": self.negotiation_mode.value,
                 "vendors": public_vendors,
                 "events": self.events,
-                "deal": None,
+                "deal": {
+                    "selected_vendor": winning_name,
+                    "commercial_score": winning_breakdown.total_score,
+                    "score_breakdown": winning_breakdown.model_dump(),
+                    "terms": winning_offer.model_dump(),
+                },
+                "final_offers": final_offers_summary,
+                "winning_vendor": winning_name,
+                "winning_offer": winning_offer.model_dump(),
+                "buyer_intelligence": buyer_intelligence,
                 "token_usage": (
                     self.groq_client.get_usage_metadata(is_demo=False).model_dump()
                     if self.groq_client
