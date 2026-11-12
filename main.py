@@ -228,13 +228,11 @@ def _run_procurement_worker(
         )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
         try:
             future = executor.submit(engine.run)
-            result = future.result(timeout=25.0)
-        except concurrent.futures.TimeoutError:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise TimeoutError("Negotiation worker timed out after 25 seconds.")
-        else:
+            result = future.result()
+        finally:
             executor.shutdown(wait=False)
 
         now_iso = datetime.now(timezone.utc).isoformat()
